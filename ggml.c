@@ -23,7 +23,6 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
-
 // #define _GNU_SOURCE
 // #include <sched.h>
 
@@ -3173,6 +3172,7 @@ static struct ggml_tensor * ggml_add_impl(
     return result;
 }
 
+
 struct ggml_tensor * ggml_add(
         struct ggml_context * ctx,
         struct ggml_tensor * a,
@@ -3415,7 +3415,8 @@ static struct ggml_tensor * ggml_mul_impl(
     GGML_ASSERT(ggml_can_repeat_rows(b, a));
 
     bool is_node = false;
-
+    // printf("a->name % s %d %d %d %d \n", a->name,a->ne[0],a->ne[1],a->ne[2],a->ne[3]);
+    // printf("b->name % s %d %d %d %d\n", b->name,b->ne[0],b->ne[1],b->ne[2],b->ne[3]);
     if (!inplace && (a->grad || b->grad)) {
         // TODO: support backward pass for broadcasting
         GGML_ASSERT(ggml_are_same_shape(a, b));
@@ -4083,19 +4084,91 @@ struct ggml_tensor * ggml_mul_mat(
     if (a->grad || b->grad) {
         is_node = true;
     }
-
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, MAX(a->n_dims, b->n_dims), ne);
-
     result->op   = GGML_OP_MUL_MAT;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
     result->src[0] = a;
     result->src[1] = b;
     result->src[2] = NULL;
     result->src[3] = NULL;
-
     return result;
 }
+
+struct ggml_tensor * ggml_mul_mat_pre_w2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * gate_gpu,
+        struct ggml_tensor  * down_gpu,
+        struct ggml_tensor  * up_gpu) {
+    GGML_ASSERT(ggml_can_mul_mat(a, b));
+    GGML_ASSERT(!ggml_is_transposed(a));
+
+    bool is_node = false;
+
+    if (a->grad || b->grad) {
+        is_node = true;
+    }
+    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, MAX(a->n_dims, b->n_dims), ne);
+    result->op   = GGML_OP_TEST;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = gate_gpu;
+    result->src[3] = down_gpu;
+    result->src[4] = up_gpu;
+    return result;
+}
+
+struct ggml_tensor * ggml_test(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(ggml_can_mul_mat(a, b));
+    GGML_ASSERT(!ggml_is_transposed(a));
+
+    bool is_node = false;
+
+    if (a->grad || b->grad) {
+        is_node = true;
+    }
+    const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, MAX(a->n_dims, b->n_dims), ne);
+    result->op   = GGML_OP_TEST;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = NULL;
+    result->src[3] = NULL;
+    return result;
+}
+
+ struct ggml_tensor * ggml_create_by_rdma_idx(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b
+        ) {
+    // TODO: support less-strict constraint
+    //       GGML_ASSERT(ggml_can_repeat(b, a));
+    // GGML_ASSERT(ggml_can_repeat_rows(b, a));
+
+    bool is_node = false;
+    // struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, MAX(a->n_dims, b->n_dims), ne);
+    int64_t row_len = a->ne[0];
+    int64_t gpu_rows = b->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, row_len, gpu_rows);
+    ggml_set_backend(result, GGML_BACKEND_GPU);
+    ggml_cuda_alloc_tensor(result);
+    result->op   = GGML_OP_CREATE_BY_RDMA;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->extra = ctx;
+    return result;
+}
+
 
 struct ggml_tensor * ggml_mul_mat_idx_upscale(
         struct ggml_context * ctx,
@@ -14943,9 +15016,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_dup(params, tensor->src[0], tensor);
             } break;
         case GGML_OP_ADD:
-            {
+            {        
+                // std::string name(tensor->name);
+                // if(name.find("gpu_index")!=std::string::npos){
+                //     printf("ggml_cuda_add\n");
+                // }
+                printf("dst->name %s \n", ggml_get_name(tensor));
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break;
+         case GGML_OP_TEST: 
+            {   printf("GGML_OP_TEST\n");
+                ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
+            } break; 
         case GGML_OP_ADD1:
             {
                 ggml_compute_forward_add1(params, tensor->src[0], tensor->src[1], tensor);
@@ -15030,6 +15112,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor->src[0], tensor->src[1], tensor);
             } break;
+          
         case GGML_OP_MUL_MAT_SPARSE:
             {
                 GGML_ASSERT(tensor->src[2] != NULL && "sparsity index is required for MUL_MAT_SPARSE");
@@ -15768,6 +15851,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
                 GGML_ASSERT(false); // TODO: not implemented
             } break;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_TEST:
         case GGML_OP_MUL_MAT_SPARSE:
         case GGML_OP_AXPY:
             {
@@ -16770,6 +16854,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_ADD:
+        case GGML_OP_CREATE_BY_RDMA: //暂时 TODO
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
             {
@@ -16822,6 +16907,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_TEST:
             {
                 n_tasks = n_threads;
 
@@ -17372,6 +17458,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                     }
                 } break;
             case GGML_OP_MUL_MAT:
+            case GGML_OP_TEST:
             case GGML_OP_MUL_MAT_SPARSE:
                 {
                     const enum ggml_type vec_dot_type = type_traits[node->src[0]->type].vec_dot_type;

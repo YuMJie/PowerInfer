@@ -5,8 +5,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <atomic>
+// #include<llama.cpp>不能加上这条
+#include<llama.h>
 #include <assert.h>
-
+#include<string>
 #if defined(GGML_USE_HIPBLAS)
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
@@ -8243,6 +8245,11 @@ static void ggml_cuda_get_rows(const ggml_tensor * src0, const ggml_tensor * src
 }
 
 static void ggml_cuda_add(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     std::string name(dst->name);
+     if(name.find("gpu_index")!=std::string::npos){
+        printf("ggml_cuda_add\n");
+    }
+
     ggml_cuda_op_flatten(src0, src1, dst, ggml_cuda_op_add);
 }
 
@@ -8526,6 +8533,129 @@ static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const
 
     ggml_cuda_pool_free(src1_as_f16, src1_as);
     ggml_cuda_pool_free(dst_f16, dst_as);
+}
+
+void ggml_cuda_create_by_rdma(const ggml_tensor * src, const ggml_tensor * gpu_bucket, ggml_tensor * dst)
+{       
+        int64_t row_len = src->ne[0];
+        int64_t gpu_rows = gpu_bucket->ne[0];
+        ggml_context * aux_ctx = (ggml_context *)(dst->extra);
+        ggml_tensor * host_mat_row = ggml_new_tensor_1d(aux_ctx, src->type, row_len);
+        static ggml_tensor * device_mat_row = ggml_dup_tensor(aux_ctx, host_mat_row);
+        ggml_set_backend(device_mat_row, GGML_BACKEND_GPU);
+        ggml_cuda_alloc_tensor(device_mat_row);
+        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(dst);
+
+        // read raw data and copy to device depending on gpu_idx
+        const enum ggml_type type = src->type;
+        const int ne0 = src->ne[0];
+        const size_t row_data_size = ne0*ggml_type_size(type)/ggml_blck_size(type);
+        for (int i = 0; i < gpu_rows; i++) {
+            int32_t host_i = i;//
+            host_mat_row -> data = (char *)(src -> data) + host_i * row_data_size;
+            char ** gpu_data_pp = reinterpret_cast<char **>(ggml_cuda_get_data_pp(device_mat_row));
+            // printf("gpu_data_p: %p\n", *gpu_data_pp);
+            ggml_cuda_cpy_1d(device_mat_row, host_mat_row);
+            *gpu_data_pp = *gpu_data_pp + row_data_size;
+        }
+        ggml_set_no_alloc(aux_ctx, false);
+        printf("%s \n", __func__);
+
+    // printf(model);
+    // if (layer.ffn_gate) {
+    //         layer.ffn_gate_gpu = create_striped_mat_to_gpu(layer.ffn_gate, gpu_bucket);
+    //         offloaded_bytes += ggml_nbytes(layer.ffn_gate_gpu);
+    // }
+    // dst = src0;
+    // offloaded_bytes += ggml_nbytes(layer.ffn_up_gpu);
+    // layer.ffn_down_gpu = create_striped_mat_to_gpu(layer.ffn_down_t, gpu_bucket);
+    // offloaded_bytes += ggml_nbytes(layer.ffn_down_gpu);
+
+}
+
+static void ggml_cuda_mul_mat_test(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) { // 需要三个layer_fnn
+    // printf("%s ", __func__);
+    const bool all_on_device =
+        (src0->backend == GGML_BACKEND_GPU || src0->backend == GGML_BACKEND_GPU_SPLIT) &&
+        (src1->backend == GGML_BACKEND_GPU) &&
+        ( dst->backend == GGML_BACKEND_GPU);
+
+    const bool split = src0->backend == GGML_BACKEND_GPU_SPLIT;
+
+    int64_t min_compute_capability = INT_MAX;
+    for (int64_t id = 0; id < g_device_count; ++id) {
+        if (min_compute_capability > g_compute_capabilities[id] && g_tensor_split[id] < (id + 1 < g_device_count ? g_tensor_split[id + 1] : 1.0f)) {
+            min_compute_capability = g_compute_capabilities[id];
+        }
+    }
+
+#ifdef CUDA_USE_TENSOR_CORES
+    const bool use_tensor_cores = true;
+#else
+    const bool use_tensor_cores = false;
+#endif
+
+    // debug helpers
+    //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+    //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+    //printf("src1: %8d %8d %8d %8d\n", src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+    //printf("      %8d %8d %8d %8d\n", src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+    //printf("src0 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src0), ggml_is_transposed(src0), ggml_type_name(src0->type), src0->name);
+    //printf("src1 is contiguous %d, transposed %d, type = %s, name = %s\n", ggml_is_contiguous(src1), ggml_is_transposed(src1), ggml_type_name(src1->type), src1->name);
+
+    if (!split && all_on_device && !use_tensor_cores && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
+        // KQ single-batch
+        ggml_cuda_mul_mat_vec_p021(src0, src1, dst);
+    } else if (!split && all_on_device && !use_tensor_cores && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1) {
+        // KQV single-batch
+        ggml_cuda_mul_mat_vec_nc(src0, src1, dst);
+    } else if (!split && all_on_device && use_tensor_cores && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1)) {
+        // KQ + KQV multi-batch
+        ggml_cuda_mul_mat_mat_batched_cublas(src0, src1, dst);
+    } else if (src0->type == GGML_TYPE_F32) {
+        ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, false);
+    } else if (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) {
+        if (src1->ne[1] == 1 && src0->ne[0] % GGML_CUDA_DMMV_X == 0) {
+#ifdef GGML_CUDA_FORCE_DMMV
+            const bool use_mul_mat_vec_q = false;
+#else
+            const bool use_mul_mat_vec_q = min_compute_capability >= MIN_CC_DP4A && ggml_is_quantized(src0->type);
+#endif // GGML_CUDA_FORCE_DMMV
+
+            if (use_mul_mat_vec_q) {
+                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, true);
+            } else {
+                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_dequantize_mul_mat_vec, false);
+            }
+        } else {
+            bool use_mul_mat_q = min_compute_capability >= MIN_CC_DP4A && ggml_is_quantized(src0->type);
+
+            // when tensor cores are available, use them for large batch size
+            // ref: https://github.com/ggerganov/llama.cpp/pull/3776
+            if (use_tensor_cores && min_compute_capability >= CC_VOLTA && src1->ne[1] > MMQ_MAX_BATCH_SIZE) {
+                use_mul_mat_q = false;
+            }
+
+            if (use_mul_mat_q) {
+                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_q, true);
+            } else {
+                ggml_cuda_op_mul_mat(src0, src1, dst, ggml_cuda_op_mul_mat_cublas, false);
+            }
+        }
+    } else {
+        GGML_ASSERT(false);
+    }
+    
+    // if(result->layer)
+    // {
+    //     printf("%s :result->layer!=NULL ",__func__);
+    // }
+    // ggml_tensor * gate_gpu = create_striped_mat_to_gpu(dst->src[2], gpu_bucket);
+
+    // ggml_tensor * up_gpu = create_striped_mat_to_gpu(dst->src[3], gpu_bucket);
+        
+    // ggml_tensor * down_gpu = create_striped_mat_to_gpu(dst->src[3], gpu_bucket);
+    
 }
 
 static void ggml_cuda_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -9054,6 +9184,7 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
             func = ggml_cuda_dup;
             break;
         case GGML_OP_ADD:
+            // printf("CUDA_GGML_OP_ADD\n");
             func = ggml_cuda_add;
             break;
         case GGML_OP_MUL:
@@ -9085,6 +9216,17 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
             }
             func = ggml_cuda_mul_mat;
             break;
+        case GGML_OP_TEST:
+            if (!any_on_device && !ggml_cuda_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
+                return false;
+            }
+            func = ggml_cuda_mul_mat_test;
+            break;
+        case GGML_OP_CREATE_BY_RDMA:
+            ggml_cuda_create_by_rdma(tensor->src[0], tensor->src[1], tensor);            return true ;
+            break;                  //可以直接用函数替代
+
+
         case GGML_OP_MUL_MAT_SPARSE:
             if (!src0_on_device && !ggml_cuda_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
                 return false;

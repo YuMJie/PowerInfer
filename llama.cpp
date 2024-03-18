@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include "ggml-alloc.h"
+#include "cuda_runtime.h"
 
 #ifdef GGML_USE_CUBLAS
 #  include "ggml-cuda.h"
@@ -1313,6 +1314,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_gpu;
     struct ggml_tensor * ffn_up_gpu;
 
+
+
     // ff bias
     struct ggml_tensor * ffn_down_b; // b2
     struct ggml_tensor * ffn_up_b;   // b3
@@ -1325,6 +1328,10 @@ struct llama_layer {
     struct ggml_tensor * gpu_idx; // index of ffn neurons on GPU
     double gpu_offload_ratio; // ratio of ffn split on GPU ([0, 1])
     struct ggml_tensor * gpu_bucket; // double index from GPU split neuron to original neuron
+
+    struct ggml_tensor * rdma_idx; // index of ffn neurons on local
+    struct ggml_tensor * rdma_bucket; // index of ffn neurons on local
+
 };
 
 struct llama_kv_cell {
@@ -2728,8 +2735,8 @@ struct llama_gpu_split_loader {
 
     llama_model_loader * idx_loader;
     size_t vram_required = 0;
-
-    llama_gpu_split_loader(const std::string & fname, bool use_mmap) : fname(fname), use_mmap(use_mmap) {
+    bool use_rdma = false;
+    llama_gpu_split_loader(const std::string & fname, bool use_mmap,bool use_rdma) : fname(fname), use_mmap(use_mmap) ,use_rdma(use_rdma) {
         GGML_ASSERT(use_mmap);
 
         idx_loader = new llama_model_loader(fname, use_mmap);
@@ -2772,8 +2779,17 @@ struct llama_gpu_split_loader {
                 LLAMA_LOG_ERROR("%s: error: failed to load gpu index or bucket\n", __func__);
                 return 1;
             }
-            model_layer.gpu_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
-            model_layer.gpu_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
+            if(use_rdma){
+                model_layer.rdma_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
+                model_layer.rdma_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
+            }
+            else
+            {
+                model_layer.gpu_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
+                // model_layer.rdma_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU); //TODO 暂时用gpu_idx
+                model_layer.gpu_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
+            }
+
         }
         llama_progress_callback cb = [](float progress, void *ctx) {
             LLAMA_LOG_INFO(".");
@@ -2805,8 +2821,54 @@ struct llama_gpu_split_loader {
 
         return 0;
     }
-};
 
+
+
+};
+    ggml_tensor * create_striped_mat_to_gpu_rdma(struct ggml_context * aux_ctx,struct ggml_tensor *src, struct ggml_tensor * gpu_bucket) {
+#ifdef GGML_USE_CUBLAS
+        if (gpu_bucket == NULL) {
+            // offload the whole tensor to gpu
+            ggml_set_backend(src, GGML_BACKEND_GPU);
+            ggml_cuda_transform_tensor(src->data, src);
+            return src;
+        }
+
+        int64_t row_len = src->ne[0];
+        int64_t gpu_rows = gpu_bucket->ne[0];
+        GGML_ASSERT(0 < gpu_rows && gpu_rows <= src->ne[1]);
+
+        ggml_set_no_alloc(aux_ctx, true);
+        ggml_tensor * gpu_dst = ggml_new_tensor_2d(aux_ctx, src->type, row_len, gpu_rows);
+        ggml_set_backend(gpu_dst, GGML_BACKEND_GPU);
+        ggml_cuda_alloc_tensor(gpu_dst);
+
+        // init two 1d views on host and device
+        ggml_tensor * host_mat_row = ggml_new_tensor_1d(aux_ctx, src->type, row_len);
+        static ggml_tensor * device_mat_row = ggml_dup_tensor(aux_ctx, host_mat_row);
+        ggml_set_backend(device_mat_row, GGML_BACKEND_GPU);
+        ggml_cuda_alloc_tensor(device_mat_row);
+        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);
+
+        // read raw data and copy to device depending on gpu_idx
+        const enum ggml_type type = src->type;
+        const int ne0 = src->ne[0];
+        const size_t row_data_size = ne0*ggml_type_size(type)/ggml_blck_size(type);
+        for (int i = 0; i < gpu_rows; i++) {
+            int32_t host_i = ((int32_t *)gpu_bucket->data)[i];
+            host_mat_row -> data = (char *)(src -> data) + host_i * row_data_size;
+            char ** gpu_data_pp = reinterpret_cast<char **>(ggml_cuda_get_data_pp(device_mat_row));
+            // printf("gpu_data_p: %p\n", *gpu_data_pp);
+            ggml_cuda_cpy_1d(device_mat_row, host_mat_row);
+            *gpu_data_pp = *gpu_data_pp + row_data_size;
+        }
+        ggml_set_no_alloc(aux_ctx, false);
+
+        return gpu_dst;
+#else
+        return NULL;
+#endif
+    }
 // to dynamically load/transform llama model weights
 struct llama_augmentation_model_loader {
     struct ggml_context * aux_ctx = nullptr;
@@ -3016,11 +3078,14 @@ struct buffered_tensor_allocator {
     }
 };
 
-static bool load_gpu_split_from_split_file(llama_model & model, std::string split_path, size_t vram_budget) {
-    llama_gpu_split_loader loader(split_path, true);
+static bool load_gpu_split_from_split_file(llama_model & model, std::string split_path, size_t vram_budget, bool use_rdma =false) {
+    llama_gpu_split_loader loader(split_path,true,use_rdma);
     return loader.check_vram_allocable(vram_budget) 
         && loader.load_gpu_idx_for_model(&model) == 0;
 }
+
+
+
 
 static bool llm_load_gpu_split_with_budget(llama_model_loader & ml, llama_model & model, size_t vram_allocatable_bytes, bool no_cache) {
     std::string cached_split_path = ml.file.fname + ".generated.gpuidx";
@@ -3075,6 +3140,59 @@ static bool llm_load_gpu_split_with_budget(llama_model_loader & ml, llama_model 
 
     return load_gpu_split_from_split_file(model, cached_split_path, vram_allocatable_bytes);
 }
+static bool llm_load_rdma_split_with_budget(llama_model_loader & ml, llama_model & model, size_t vram_allocatable_bytes, bool no_cache) {
+    std::string cached_split_path = "./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf.generated_rdma.gpuidx"; //TODO
+    std::string model_basedir ="./ReluLLaMA-7B"; //TODO 不用常量会乱码，可以把llm_load_gpu_split_with_budget_for_rdma放到前面
+
+    // Load GPU split from previously generated cache
+    if (access(cached_split_path.c_str(), F_OK) == 0 && !no_cache) {
+        if (load_gpu_split_from_split_file(model, cached_split_path, vram_allocatable_bytes,true)) {
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: error: failed to apply previously generated gpu split from '%s'\n", __func__, cached_split_path.c_str());
+    }
+
+    // Generate GPU split
+    std::string activation_path = std::string(model_basedir);
+#if defined (_WIN32)
+    activation_path += "\\activation";
+#else
+    activation_path += "/activation";
+#endif
+    if (access(activation_path.c_str(), F_OK) != 0) {
+        LLAMA_LOG_ERROR("%s: error: activation files under '%s' not found\n", __func__, activation_path.c_str());
+        return false;
+    }
+
+    // Calculate solver parameters
+    ggml_tensor * ffn_up = model.layers[0].ffn_up;
+    ggml_tensor * ffn_gate = model.layers[0].ffn_gate;
+    int slice_size = ffn_up->ne[1] * ggml_type_size(ffn_up->type) / ggml_blck_size(ffn_up->type);
+    // For model arch with FFN gate, the gate is also sliced, otherwise only the up and down matrices are sliced
+    int vram_bytes_per_slice = slice_size * (ffn_gate ? 4.5 : 2); // TODO: why 4.5, not 3?
+    int neuron_cap = floor((double)vram_allocatable_bytes / vram_bytes_per_slice) * 4;
+
+    LLAMA_LOG_INFO("invoking powerinfer Python module to generate gpu split for %.2f MiB of VRAM\n", vram_allocatable_bytes / 1024.0 / 1024.0);
+
+    std::stringstream command_ss;
+#if defined (_WIN32)
+    command_ss << "python -m powerinfer"
+#else
+    command_ss << "python3 -m powerinfer"
+#endif
+               << " --activation " << activation_path
+               << " --layer " << model.hparams.n_layer
+               << " --neuron " << ffn_up->ne[1]
+               << " --capacity " << neuron_cap
+               << " --vram-capacity " << vram_allocatable_bytes
+               << " --output " << cached_split_path;
+    if (system(command_ss.str().c_str()) != 0 || access(cached_split_path.c_str(), F_OK) != 0) {
+        LLAMA_LOG_ERROR("%s: error: failed to generate gpu split\n", __func__);
+        return false;
+    }
+
+    return load_gpu_split_from_split_file(model, cached_split_path, vram_allocatable_bytes,true);
+}
 
 static size_t llm_load_gpu_split(llama_model_loader & ml, llama_model & model, bool no_cache, bool no_offload) {
 #if defined (GGML_USE_CUBLAS)
@@ -3082,6 +3200,10 @@ static size_t llm_load_gpu_split(llama_model_loader & ml, llama_model & model, b
         throw std::runtime_error(format("cannot offload to GPU: " GGML_CUDA_NAME " not loaded"));
     }
     if (!no_offload && !llm_load_gpu_split_with_budget(ml, model, vram_budget_bytes, no_cache)) {
+        LLAMA_LOG_ERROR("%s: error: failed to generate gpu split, an empty one will be used\n", __func__);
+    }
+    if (!no_offload && !llm_load_rdma_split_with_budget(ml, model, vram_budget_bytes, no_cache)) {
+        
         LLAMA_LOG_ERROR("%s: error: failed to generate gpu split, an empty one will be used\n", __func__);
     }
 #endif
@@ -4461,7 +4583,6 @@ static struct ggml_tensor * llm_build_ffn_sparse(
    const llm_build_cb_short & cb_outer) {
     bool full_gpu = gpu_offload_ratio >= 1.0;
     ggml_tensor * ffn_input = cur;
-
     llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * cur, const char * name) {
         cb_outer(cur, name);
 #if defined(GGML_USE_CUBLAS)
@@ -4518,6 +4639,127 @@ static struct ggml_tensor * llm_build_ffn_sparse(
         cur = ggml_mul(ctx, cur, up_out);
         cb(cur, "ffn_gate_par");
     }
+
+    cur = llm_build_sparse_axpy(ctx, down_t, cur, idx, down_gpu, gpu_index, gpu_bucket, cb_outer, "down", full_gpu);
+
+    if (down_b) {
+        cur = ggml_add(ctx, cur, down_b);
+        cb(cur, "ffn_down_b");
+    }
+
+    return cur;
+}
+void printf_dim(ggml_tensor * t, const char * name) {
+    printf("%s: %s: %d %d %d %d\n", __func__, name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
+static struct ggml_tensor * llm_build_ffn_sparse_rdma(
+        struct ggml_context * ctx,
+         struct ggml_tensor * cur,
+         struct ggml_tensor * up,
+         struct ggml_tensor * up_b,
+         struct ggml_tensor * gate,
+         struct ggml_tensor * gate_b,
+         struct ggml_tensor * down,
+         struct ggml_tensor * down_b,
+         struct ggml_tensor * down_t,
+         struct ggml_tensor * pre_w1,
+         struct ggml_tensor * pre_w2,
+         struct ggml_tensor * pred_inpl,
+         struct ggml_tensor * gpu_index,
+         struct ggml_tensor * gpu_bucket,
+         struct ggml_tensor * gate_gpu,
+         struct ggml_tensor * down_gpu,
+         struct ggml_tensor * up_gpu,
+         struct ggml_tensor * rdma_idx,
+         struct ggml_tensor * rdma_bucket,
+         const struct llama_layer * layer,
+            llm_ffn_op_type   type_op,
+          llm_ffn_gate_type   type_gate,
+                     double   gpu_offload_ratio,
+   const llm_build_cb_short & cb_outer,int &il
+   ) {
+    // printf("%s",__func__);
+    bool full_gpu = gpu_offload_ratio >= 1.0;
+    ggml_tensor * ffn_input = cur;
+    llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * cur, const char * name) {
+        cb_outer(cur, name);
+#if defined(GGML_USE_CUBLAS)
+        // Determine offloading based on src[0] (weight for both mul and axpy)
+        bool operates_on_gpu = cur->src[0]->backend == GGML_BACKEND_GPU;
+        if (operates_on_gpu) {
+            ggml_cuda_assign_buffers_no_alloc(cur);
+        }
+#endif
+    };
+
+    // prepare sparse idx
+    ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
+    cb(idx, "mlp_pre_hidden");
+    idx = ggml_relu(ctx, idx);
+    cb(idx, "mlp_pre_relu");
+    idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,gate_gpu,down_gpu,up_gpu);
+    // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
+    // back to the CPU to avoid synchronization issues.
+    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+
+    // if(il == 0)
+    // {
+    // printf_dim(pred_inpl, "pred_inpl");
+    // printf_dim(pre_w1, "pre_w1");
+    // printf_dim(pre_w2, "pre_w2");
+    // printf_dim(rdma_idx, "rdma_idx");
+    // printf_dim(gpu_index, "gpu_index");
+    // printf_dim(idx, "idx");
+    // }
+
+    // idx = ggml_add(ctx, idx, gpu_index);
+
+    // printf("gpu_index: %s\n", gpu_index->name);
+    // printf_dim(up_gpu, "up_gpu");
+
+    // {
+        // free(up_gpu->data);
+        cudaFree(up_gpu->data);
+        up_gpu = create_striped_mat_to_gpu_rdma(ctx,up, gpu_bucket);//
+    // }
+    // printf_dim(up_gpu, "up_gpu1");
+    // FFN up
+    struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);
+    if (up_b) {
+        up_out = ggml_add(ctx, up_out, up_b);
+        cb(up_out, "ffn_up_b");
+    }
+    // printf("llm_build_sparse_mul_mat\n");
+    if (gate) {
+        // TODO: only support par for now
+        GGML_ASSERT(type_gate == LLM_FFN_PAR);
+        ggml_tensor * gate_out = llm_build_sparse_mul_mat(ctx, gate, ffn_input, idx, gate_gpu, gpu_index, gpu_bucket, cb_outer, "gate", full_gpu);
+        if (gate_b) {
+            gate_out = ggml_add(ctx, gate_out, gate_b);
+            cb(gate_out, "ffn_gate_b");
+        }
+        cur = gate_out;
+    } else {
+        cur = up_out;
+    }
+    // printf("gate_llm_build_sparse_mul_mat\n");
+
+    switch (type_op) {
+        case LLM_FFN_RELU:
+            {
+                cur = ggml_relu(ctx, cur);
+                cb(cur, "ffn_relu");
+            } break;
+        default:
+            // only support relu for now
+            GGML_ASSERT(type_op == LLM_FFN_RELU);
+    }
+
+    if (type_gate == LLM_FFN_PAR) {
+        cur = ggml_mul(ctx, cur, up_out);
+        cb(cur, "ffn_gate_par");
+    }
+    // printf("ggml_mul\n");
 
     cur = llm_build_sparse_axpy(ctx, down_t, cur, idx, down_gpu, gpu_index, gpu_bucket, cb_outer, "down", full_gpu);
 
@@ -4749,7 +4991,7 @@ struct llm_build_context {
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
-
+            const llama_layer * layer = & model.layers[il];
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm, NULL,
@@ -4810,7 +5052,7 @@ struct llm_build_context {
                     } else {
                         cbs(cur, "ffn_norm");
                     }
-                    cur = llm_build_ffn_sparse(ctx0, cur,
+                    cur = llm_build_ffn_sparse_rdma(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,
                         model.layers[il].ffn_gate, NULL,
                         model.layers[il].ffn_down, NULL,
@@ -4819,8 +5061,8 @@ struct llm_build_context {
                         model.layers[il].mlp_pre_w2,
                         ffn_inp, // as for now, llama's pred use the same input as the ffn
                         model.layers[il].gpu_idx, 
-                        model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,
-                        LLM_FFN_RELU, LLM_FFN_PAR, model.layers[il].gpu_offload_ratio, cbs);
+                        model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,model.layers[il].rdma_idx,model.layers[il].rdma_bucket,layer,
+                        LLM_FFN_RELU, LLM_FFN_PAR, model.layers[il].gpu_offload_ratio, cbs,il);
                 } else {
                     // fallback to dense
                     cb(cur, "ffn_norm", il);

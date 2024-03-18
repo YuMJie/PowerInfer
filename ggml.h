@@ -467,6 +467,8 @@ extern "C" {
         GGML_OP_CROSS_ENTROPY_LOSS_BACK,
 
         GGML_OP_COUNT,
+        GGML_OP_TEST,
+        GGML_OP_CREATE_BY_RDMA
     };
 
     enum ggml_unary_op {
@@ -544,7 +546,7 @@ extern "C" {
         size_t               view_offs;
 
         void * data;
-
+        // void * layer;
         char name[GGML_MAX_NAME];
 
         void * extra; // extra things e.g. for ggml-cuda.cu
@@ -805,7 +807,11 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dup_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
-
+    GGML_API struct ggml_tensor * ggml_create_by_rdma_idx(
+                struct ggml_context * ctx,
+                struct ggml_tensor * a,
+                struct ggml_tensor * b
+                );
     GGML_API struct ggml_tensor * ggml_add(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1091,6 +1097,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+    GGML_API struct ggml_tensor * ggml_mul_mat_pre_w2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * gate_gpu,
+        struct ggml_tensor  * down_gpu,
+        struct ggml_tensor  * up_gpu); 
+    GGML_API struct ggml_tensor * ggml_test(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor *ggml_mul_mat_idx(
             struct ggml_context *ctx,
             struct ggml_tensor *a,
