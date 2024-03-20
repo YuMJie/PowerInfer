@@ -3172,6 +3172,33 @@ static struct ggml_tensor * ggml_add_impl(
     return result;
 }
 
+struct ggml_tensor * ggml_add_rdma(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        bool inplace ) {
+    // TODO: support less-strict constraint
+    //       GGML_ASSERT(ggml_can_repeat(b, a));
+    GGML_ASSERT(ggml_can_repeat_rows(b, a));
+    inplace = false;
+    bool is_node = false;
+
+    if (!inplace && (a->grad || b->grad)) {
+        // TODO: support backward pass for broadcasting
+        GGML_ASSERT(ggml_are_same_shape(a, b));
+        is_node = true;
+    }
+
+    struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+
+    result->op   = GGML_OP_ADD_RDMA;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = NULL;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_add(
         struct ggml_context * ctx,
@@ -4101,7 +4128,8 @@ struct ggml_tensor * ggml_mul_mat_pre_w2(
         struct ggml_tensor  * b,
         struct ggml_tensor  * gate_gpu,
         struct ggml_tensor  * down_gpu,
-        struct ggml_tensor  * up_gpu) {
+        struct ggml_tensor  * up_gpu,
+        int il, const struct  llama_layer * layer ) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
 
@@ -4119,9 +4147,38 @@ struct ggml_tensor * ggml_mul_mat_pre_w2(
     result->src[2] = gate_gpu;
     result->src[3] = down_gpu;
     result->src[4] = up_gpu;
+    result->il=il;
+    result->layer=layer;
     return result;
 }
+struct ggml_tensor * ggml_assign(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * gate_gpu,
+        struct ggml_tensor  * down_gpu,
+        struct ggml_tensor  * up_gpu,
+        int il, const struct  llama_layer * layer ) {
+    // GGML_ASSERT(ggml_can_mul_mat(a, b));
+    // GGML_ASSERT(!ggml_is_transposed(a));
 
+    bool is_node = false;
+
+    if (a->grad || b->grad) {
+        is_node = true;
+    }
+    // const int64_t ne[4] = { a->ne[0], a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, up_gpu->type, up_gpu->n_dims, up_gpu->ne);
+    result->op   = GGML_OP_ASSIGN;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = gate_gpu;
+    result->src[3] = down_gpu;
+    result->src[4] = up_gpu;
+    result->ctx =ctx;
+    return result;
+}
 struct ggml_tensor * ggml_test(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -7368,6 +7425,53 @@ static void ggml_compute_forward_add(
                 GGML_ASSERT(false);
             } break;
     }
+}
+static void ggml_compute_forward_add_rdma(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    // printf("src0->data =%d\n",((int8_t *)(src0->data))[0]);
+    // printf("src1->data =%f\n",((float *)(src1->data))[0]);
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_add_f32(params, src0, src1, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                if (src1->type == GGML_TYPE_F16) {
+                    ggml_compute_forward_add_f16_f16(params, src0, src1, dst);
+                }
+                else if (src1->type == GGML_TYPE_F32) {
+                    ggml_compute_forward_add_f16_f32(params, src0, src1, dst);
+                }
+                else {
+                    GGML_ASSERT(false);
+                }
+            } break;
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            {
+                ggml_compute_forward_add_q_f32(params, src0, src1, dst);
+            } break;
+        default:
+            {
+                GGML_ASSERT(false);
+            } break;
+    }
+    // printf("rdma->data =%f\n",((float *)(dst->data))[0]);
+
+    // printf("src0->type =%d\n",src0->type);
+    // printf("src1->type =%d\n",src1->type);
 }
 
 // ggml_compute_forward_add1
@@ -14122,7 +14226,15 @@ static void ggml_compute_forward_mul_mat_sparse(
     ggml_from_float_t const from_float_to_vec_dot = type_traits[vec_dot_type].from_float;
 
     const float threshold = sparse_pred_threshold;
-
+    if(ne0!=ne01)
+    {   
+        printf("dst->name %s\n", dst->name);
+        printf("src0->name %s\n", src0->name); 
+        printf("src1->name %s\n", src1->name);
+        printf("dst->src[3]->name %s\n", dst->src[3]->name);
+        printf("ne0 %d\n", ne0);
+        printf("ne01 %d\n", ne01);
+    }
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
     GGML_ASSERT(ne2 == ne12);
@@ -15016,13 +15128,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_dup(params, tensor->src[0], tensor);
             } break;
         case GGML_OP_ADD:
+        {        
+                // std::string name(tensor->name);
+                // if(name.find("gpu_index")!=std::string::npos){
+                //     printf("ggml_cuda_add\n");
+                // }
+                // printf("dst->name %s \n", ggml_get_name(tensor));
+                ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
+        } break;
+        case GGML_OP_ADD_RDMA:
             {        
                 // std::string name(tensor->name);
                 // if(name.find("gpu_index")!=std::string::npos){
                 //     printf("ggml_cuda_add\n");
                 // }
-                printf("dst->name %s \n", ggml_get_name(tensor));
-                ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
+                // printf("dst->name %s \n", ggml_get_name(tensor));
+                ggml_compute_forward_add_rdma(params, tensor->src[0], tensor->src[1], tensor);
             } break;
          case GGML_OP_TEST: 
             {   printf("GGML_OP_TEST\n");
@@ -16854,6 +16975,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_ADD:
+        case GGML_OP_ADD_RDMA:
         case GGML_OP_CREATE_BY_RDMA: //暂时 TODO
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
@@ -16870,6 +16992,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
         case GGML_OP_REPEAT:
+        case GGML_OP_ASSIGN: //暂时 TODO
         case GGML_OP_REPEAT_BACK:
             {
                 n_tasks = 1;
@@ -17441,6 +17564,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
                     }
                 } break;
             case GGML_OP_ADD:
+            case GGML_OP_ADD_RDMA:
             case GGML_OP_ADD1:
                 {
                     n_tasks = n_threads;

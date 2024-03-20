@@ -2957,6 +2957,10 @@ struct llama_augmentation_model_loader {
         }
         
         layer.ffn_up_gpu = create_striped_mat_to_gpu(layer.ffn_up, gpu_bucket);
+        // struct ggml_tensor * temp  = create_striped_mat_to_gpu(layer.ffn_up, gpu_bucket);
+        // printf("create_striped_mat_to_gpu \n")
+        // ggml_cuda_free_data(temp);
+        // printf("ggml_cuda_free_data\n");
         offloaded_bytes += ggml_nbytes(layer.ffn_up_gpu);
         
         layer.ffn_down_gpu = create_striped_mat_to_gpu(layer.ffn_down_t, gpu_bucket);
@@ -4472,7 +4476,9 @@ static struct ggml_tensor * llm_build_ffn(
 
     return cur;
 }
-
+void printf_dim(ggml_tensor * t) {
+    printf("%s: %s: %d %d %d %d\n", __func__, t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
 static struct ggml_tensor * llm_build_sparse_mul_mat(
         struct ggml_context * ctx,
          struct ggml_tensor * up,
@@ -4490,6 +4496,7 @@ static struct ggml_tensor * llm_build_sparse_mul_mat(
 #ifdef GGML_USE_CUBLAS
     // Full offloading fast path
     if (full_gpu) {
+        printf("%s: full_gpu\n", __func__);
         GGML_ASSERT(up_gpu && "full_gpu but no up_gpu");
         out = ggml_mul_mat_idx(ctx, up_gpu, inp, idx, NULL);
         ggml_cuda_assign_buffers_no_alloc(out);
@@ -4503,9 +4510,13 @@ static struct ggml_tensor * llm_build_sparse_mul_mat(
 
 #ifdef GGML_USE_CUBLAS
     if (up_gpu) {
+        // printf_dim(up_gpu);
+        // printf_dim(inp);
         ggml_tensor * out_gpu = ggml_mul_mat_idx_upscale(ctx, up_gpu, inp, idx, gpu_bucket, out->ne[0]);
         ggml_cuda_assign_buffers_no_alloc(out_gpu);
+        // printf_dim(out_gpu, "out_gpu");
         cb(out_gpu, (full_name + "_gpu").c_str());
+        // printf_dim(out_gpu);
         out = ggml_add(ctx, out, out_gpu);
         // We don't need to assign buffers here, as the output will be passed into Axpy,
         // which in this case, is also a hybrid operation.
@@ -4649,9 +4660,7 @@ static struct ggml_tensor * llm_build_ffn_sparse(
 
     return cur;
 }
-void printf_dim(ggml_tensor * t, const char * name) {
-    printf("%s: %s: %d %d %d %d\n", __func__, name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-}
+
 static struct ggml_tensor * llm_build_ffn_sparse_rdma(
         struct ggml_context * ctx,
          struct ggml_tensor * cur,
@@ -4697,11 +4706,22 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     cb(idx, "mlp_pre_hidden");
     idx = ggml_relu(ctx, idx);
     cb(idx, "mlp_pre_relu");
-    idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,gate_gpu,down_gpu,up_gpu);
+    idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,up,gpu_bucket,up_gpu,il,layer);
     // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
     // back to the CPU to avoid synchronization issues.
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+    // printf_dim(up_gpu, "up_gpu");
 
+    // printf_dim(rdma_idx);
+    // printf_dim(idx);
+    if(idx->ne[1]==rdma_idx->ne[1])
+    {
+        rdma_idx = ggml_add_rdma(ctx,idx,rdma_idx,false);
+        cb(rdma_idx, "rdma_idx");
+    }
+    up_gpu = ggml_assign(ctx, gpu_bucket, rdma_idx,idx,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
+    cb(up_gpu, "up_gpu_1");
+    // up_gpu->extra = layer->ffn_up_gpu->extra;
     // if(il == 0)
     // {
     // printf_dim(pred_inpl, "pred_inpl");
@@ -4719,8 +4739,11 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
 
     // {
         // free(up_gpu->data);
-        cudaFree(up_gpu->data);
-        up_gpu = create_striped_mat_to_gpu_rdma(ctx,up, gpu_bucket);//
+        // printf("create_striped_mat_to_gpu_rdma \n");
+        // struct ggml_tensor * temp = create_striped_mat_to_gpu_rdma(ctx,up, gpu_bucket);//out of memory
+        // printf("create_striped_mat_to_gpu_rdma1\n");
+        // ggml_cuda_free_data(temp);
+        // printf("ggml_cuda_free_data\n");
     // }
     // printf_dim(up_gpu, "up_gpu1");
     // FFN up
@@ -4991,7 +5014,7 @@ struct llm_build_context {
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
-            const llama_layer * layer = & model.layers[il];
+            const llama_layer * layer = il ? &model.layers[il-1] :& model.layers[il];
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm, NULL,

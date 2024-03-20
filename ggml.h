@@ -389,6 +389,7 @@ extern "C" {
 
         GGML_OP_DUP,
         GGML_OP_ADD,
+        GGML_OP_ADD_RDMA,
         GGML_OP_ADD1,
         GGML_OP_ACC,
         GGML_OP_SUB,
@@ -468,6 +469,7 @@ extern "C" {
 
         GGML_OP_COUNT,
         GGML_OP_TEST,
+        GGML_OP_ASSIGN,
         GGML_OP_CREATE_BY_RDMA
     };
 
@@ -552,6 +554,9 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
         char padding[12];
+        int il;
+        struct llama_layer * layer;
+        struct ggml_context * ctx;
     };
 
 
@@ -816,7 +821,11 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
-
+GGML_API struct ggml_tensor * ggml_add_rdma(
+        struct ggml_context * ctx,
+        struct ggml_tensor * a,
+        struct ggml_tensor * b,
+        bool inplace);
     GGML_API struct ggml_tensor *ggml_add_idx(
             struct ggml_context *ctx,
             struct ggml_tensor *a,
@@ -1103,12 +1112,20 @@ extern "C" {
         struct ggml_tensor  * b,
         struct ggml_tensor  * gate_gpu,
         struct ggml_tensor  * down_gpu,
-        struct ggml_tensor  * up_gpu); 
+        struct ggml_tensor  * up_gpu,
+        int il, const struct  llama_layer * layer );
     GGML_API struct ggml_tensor * ggml_test(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
-
+   GGML_API struct ggml_tensor * ggml_assign(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * gate_gpu,
+        struct ggml_tensor  * down_gpu,
+        struct ggml_tensor  * up_gpu,
+        int il, const struct  llama_layer * layer );
     GGML_API struct ggml_tensor *ggml_mul_mat_idx(
             struct ggml_context *ctx,
             struct ggml_tensor *a,
