@@ -4719,12 +4719,11 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     idx = ggml_relu(ctx, idx);
     cb(idx, "mlp_pre_relu");
     idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,up,gpu_bucket,up_gpu,il,layer);
+    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
+
     ggml_tensor *idx_threshold = ggml_threshold(ctx, idx);
     cb(idx_threshold, "idx_threshold");
     // printf("idx: %d\n", idx->backend);
-    // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
-    // back to the CPU to avoid synchronization issues.
-    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
     // printf_dim(up_gpu, "up_gpu");
     // printf("il: %d\n",il);
     struct ggml_tensor * tensor = ((struct ggml_tensor **) rdma_idx_vec)[il];

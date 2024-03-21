@@ -597,6 +597,15 @@ static __global__ void relu_f32(const float * x, float * dst, const int k) {
     dst[i] = fmaxf(x[i], 0);
 }
 
+static __global__ void threshold_f32(const float * x, float * dst, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+    dst[i] = x[i]> 0? 1: 0;
+}
+
 static __global__ void sqr_f32(const float * x, float * dst, const int k) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -5196,6 +5205,11 @@ static void relu_f32_cuda(const float * x, float * dst, const int k, cudaStream_
     relu_f32<<<num_blocks, CUDA_RELU_BLOCK_SIZE, 0, stream>>>(x, dst, k);
 }
 
+static void threshold_f32_cuda(const float * x, float * dst, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_RELU_BLOCK_SIZE - 1) / CUDA_RELU_BLOCK_SIZE;
+    threshold_f32<<<num_blocks, CUDA_RELU_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+}
+
 static void sqr_f32_cuda(const float * x, float * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_SQR_BLOCK_SIZE - 1) / CUDA_SQR_BLOCK_SIZE;
     sqr_f32<<<num_blocks, CUDA_SQR_BLOCK_SIZE, 0, stream>>>(x, dst, k);
@@ -6756,6 +6770,21 @@ inline void ggml_cuda_op_relu(
     (void) src1_dd;
 }
 
+inline void ggml_cuda_op_threshold(
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+    const float * src0_dd, const float * src1_dd, float * dst_dd, const cudaStream_t & main_stream) {
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    threshold_f32_cuda(src0_dd, dst_dd, ggml_nelements(src0), main_stream);
+
+    (void) src1;
+    (void) dst;
+    (void) src1_dd;
+}
+
+
 inline void ggml_cuda_op_sqr(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const float * src0_dd, const float * src1_dd, float * dst_dd, const cudaStream_t & main_stream) {
@@ -8275,6 +8304,10 @@ static void ggml_cuda_silu(const ggml_tensor * src0, const ggml_tensor * src1, g
 static void ggml_cuda_relu(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cuda_op_flatten(src0, src1, dst, ggml_cuda_op_relu);
 }
+static void ggml_cuda_threshold(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // return ;
+    ggml_cuda_op_flatten(src0, src1, dst, ggml_cuda_op_threshold);
+}
 
 static void ggml_cuda_sqr(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_cuda_op_flatten(src0, src1, dst, ggml_cuda_op_sqr);
@@ -8541,9 +8574,7 @@ static void ggml_cuda_mul_mat_mat_batched_cublas(const ggml_tensor * src0, const
     ggml_cuda_pool_free(src1_as_f16, src1_as);
     ggml_cuda_pool_free(dst_f16, dst_as);
 }
-void ggml_cuda_threshold(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    printf("%s \n",__func__);
-}
+
 
 
 void ggml_cuda_create_by_rdma(const ggml_tensor * src, const ggml_tensor * gpu_bucket, ggml_tensor * dst)
@@ -9332,7 +9363,7 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
 
     ggml_cuda_func_t func;
     const bool src0_on_device = tensor->src[0] != nullptr && (tensor->src[0]->backend != GGML_BACKEND_CPU);
-    const bool any_on_device = tensor->backend == GGML_BACKEND_GPU || src0_on_device
+    const bool any_on_device = tensor->backend == GGML_BACKEND_GPU || src0_on_device //至少有一个在gpu上
         || (tensor->src[1] != nullptr && tensor->src[1]->backend == GGML_BACKEND_GPU);
 
     // when src0 (weights) is not on device, we compute on CPU with sparsity

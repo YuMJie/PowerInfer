@@ -15311,7 +15311,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break; 
          case GGML_OP_THRESHOLD: 
-            {   printf("GGML_OP_TEST\n");
+            {   printf("GGML_OP_THRESHOLD\n");
+                return ;
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break; 
         case GGML_OP_ADD1:
@@ -15400,7 +15401,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
           
         case GGML_OP_MUL_MAT_SPARSE:
-            {
+            {   
+
                 GGML_ASSERT(tensor->src[2] != NULL && "sparsity index is required for MUL_MAT_SPARSE");
 
                 // MUL_MAT_SPARSE is the first operation in the FFN block, and
