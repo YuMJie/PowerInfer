@@ -15267,7 +15267,7 @@ static void ggml_ensure_tensor_data_at_memory(struct ggml_tensor * tensor) {
 #endif
 }
 
-static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) { //用了ggml_cuda_compute_forward
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE) {
@@ -15275,7 +15275,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
 #ifdef GGML_USE_CUBLAS
-    bool skip_cpu = ggml_cuda_compute_forward(params, tensor);
+    bool skip_cpu = ggml_cuda_compute_forward(params, tensor); //优先用cuda函数
     if (skip_cpu) {
         return;
     }
@@ -17734,7 +17734,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
             case GGML_OP_ADD1:
                 {
                     n_tasks = n_threads;
-                    n_tasks = 1; //暂时为1
+                    // n_tasks = 1; //暂时为1
 
                     if (ggml_is_quantized(node->src[0]->type)) {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;

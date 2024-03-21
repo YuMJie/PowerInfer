@@ -9340,7 +9340,6 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
         || !any_on_device && tensor->op != GGML_OP_MUL_MAT) {
         return false;
     }
-
     if (tensor->op == GGML_OP_MUL_MAT) {
         if (tensor->src[0]->ne[3] != tensor->src[1]->ne[3]) {
 #ifndef NDEBUG
@@ -9415,8 +9414,6 @@ bool ggml_cuda_compute_forward(struct ggml_compute_params * params, struct ggml_
         case GGML_OP_CREATE_BY_RDMA:
             ggml_cuda_create_by_rdma(tensor->src[0], tensor->src[1], tensor);            return true ;
             break;                  //可以直接用函数替代
-
-
         case GGML_OP_MUL_MAT_SPARSE:
             if (!src0_on_device && !ggml_cuda_can_mul_mat(tensor->src[0], tensor->src[1], tensor)) {
                 return false;
