@@ -268,6 +268,8 @@ typedef double ggml_float;
 // global data
 //
 
+
+
 // precomputed gelu table for f16 (128 KB)
 static ggml_fp16_t ggml_table_gelu_f16[1 << 16];
 
@@ -317,6 +319,8 @@ void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int n) {
         y[i] = GGML_FP32_TO_FP16(x[i]);
     }
 }
+
+// 
 
 //
 // timing
@@ -3175,28 +3179,28 @@ static struct ggml_tensor * ggml_add_impl(
 struct ggml_tensor * ggml_add_rdma(
         struct ggml_context * ctx,
         struct ggml_tensor * a,
-        struct ggml_tensor * b,
+        int il,
         bool inplace ) {
     // TODO: support less-strict constraint
     //       GGML_ASSERT(ggml_can_repeat(b, a));
-    GGML_ASSERT(ggml_can_repeat_rows(b, a));
+    // GGML_ASSERT(ggml_can_repeat_rows(b, a));
     inplace = false;
     bool is_node = false;
 
-    if (!inplace && (a->grad || b->grad)) {
-        // TODO: support backward pass for broadcasting
-        GGML_ASSERT(ggml_are_same_shape(a, b));
-        is_node = true;
-    }
+    // if (!inplace && (a->grad || b->grad)) {
+    //     // TODO: support backward pass for broadcasting
+    //     GGML_ASSERT(ggml_are_same_shape(a, b));
+    //     is_node = true;
+    // }
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
-
+    result ->il = il;
     result->op   = GGML_OP_ADD_RDMA;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
     result->src[0] = a;
-    result->src[1] = b;
+    result->src[1] = NULL;
     result->src[2] = NULL;
-
+    result->il = il;
     return result;
 }
 
@@ -4153,30 +4157,54 @@ struct ggml_tensor * ggml_mul_mat_pre_w2(
 }
 struct ggml_tensor * ggml_assign(
         struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b,
-        struct ggml_tensor  * gate_gpu,
-        struct ggml_tensor  * down_gpu,
+        struct ggml_tensor  * gpu_bucket,
         struct ggml_tensor  * up_gpu,
+        struct ggml_tensor  * gate_gpu,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * up_gpu_1,
         int il, const struct  llama_layer * layer ) {
     // GGML_ASSERT(ggml_can_mul_mat(a, b));
     // GGML_ASSERT(!ggml_is_transposed(a));
 
-    bool is_node = false;
+    // bool is_node = false;
 
-    if (a->grad || b->grad) {
-        is_node = true;
-    }
+    // if (a->grad || b->grad) {
+    //     is_node = true;
+    // }
     // const int64_t ne[4] = { a->ne[0], a->ne[1], a->ne[2], a->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, up_gpu->type, up_gpu->n_dims, up_gpu->ne);
+    // if(up==NULL)
+    // {
+    //     printf("up is null \n"); //full_gpu时
+    // }
+    // if(gpu_bucket==NULL)
+    // {
+    //     printf("gpu_bucket is null \n"); //full_gpu时gpu_bucketis null
+    // }
+    // printf("%s :up->ne[0] %d, gpu_bucket->ne[0] %d\n", __func__, up->ne[0], gpu_bucket->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, up->type,  up_gpu->ne[0], up_gpu->ne[1]);
+    // printf("crteat \n ");
     result->op   = GGML_OP_ASSIGN;
-    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
-    result->src[0] = a;
-    result->src[1] = b;
+    // result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src[0] = up_gpu;
+    result->src[1] = up_gpu;
     result->src[2] = gate_gpu;
-    result->src[3] = down_gpu;
-    result->src[4] = up_gpu;
+    result->src[3] = up;
+    result->src[4] = up_gpu_1;
     result->ctx =ctx;
+    return result;
+}
+
+struct ggml_tensor * ggml_threshold(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a
+        ) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, MAX(a->n_dims, a->n_dims), a->ne);
+    result->op   = GGML_OP_THRESHOLD;
+    result->grad = a->grad;
+    result->src[0] = a;
+    result->src[1] = NULL;
+    result->src[2] = NULL;
+    result->src[3] = NULL;
     return result;
 }
 struct ggml_tensor * ggml_test(
@@ -7176,6 +7204,119 @@ static void ggml_compute_forward_add_f32(
     }
 }
 
+static void ggml_compute_forward_add_f32_INT_8(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    GGML_ASSERT(ggml_can_repeat_rows(src1, src0) && ggml_are_same_shape(src0, dst));
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr  = ggml_nrows(src0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT( nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+    struct ggml_tensor *src2 = dst->src[2];
+    float *ft;
+    if (src2 != NULL) 
+        ft = src2->data;
+
+    if (nb10 == sizeof(float)) {
+        for (int ir = ir0; ir < ir1; ++ir) {
+            // src1 is broadcastable across src0 and dst in i1, i2, i3
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+            const int64_t i13 = i03 % ne13;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i11 = i01 % ne11;
+
+            float * dst_ptr  = (float *) ((char *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+            float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+            int8_t * src1_ptr = (int8_t *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+
+#ifdef GGML_USE_ACCELERATE
+            vDSP_vadd(src0_ptr, 1, src1_ptr, 1, dst_ptr, 1, ne00);
+#else
+            // ggml_vec_add_f32(ne00, dst_ptr, src0_ptr, src1_ptr);
+            if (src2 == NULL)
+                ggml_vec_add_f32(ne00, dst_ptr, src0_ptr, src1_ptr);
+            else
+            {
+                // printf("head %d\n", src2->ne[0]);
+                // int k;
+                // scanf("%d", &k);
+                // ggml_vec_add_f32(ne00, dst_ptr, src0_ptr, src1_ptr);
+                int num = src2->ne[0];
+                if (num > 1000) {
+                    for (int i = 0; i < ne00; i++)
+                    {
+                        dst_ptr[i] = ft[i] >= 0.0f ? src0_ptr[i] + src1_ptr[i] : 0;
+                    }
+                }
+                else {
+                    // ggml_set_zero(dst);
+                    for (int i = 0; i < num; i++)
+                    {
+                        int id = i << 7;
+                        /* dst_ptr[i] = ft[id] > 0.4? src0_ptr[i] + src1_ptr[i] : 0; */
+                        if (ft[i] < -7.0f){
+                            for (int j = 0; j < 128; j++)
+                                dst_ptr[id + j] = 0;
+                            // dst_ptr[i]  = 0;
+                            continue;
+                        }
+                        else
+                        {
+                            for (int j = 0; j < 128; j++)
+                                dst_ptr[id+j] = src0_ptr[id+j] + src1_ptr[id+j];
+                        }
+                            // dst_ptr[i] = src0_ptr[i] + src1_ptr[i];
+                    }
+                }
+            }
+#endif
+        }
+    } else {
+        // src1 is not contiguous
+        for (int ir = ir0; ir < ir1; ++ir) {
+            // src1 is broadcastable across src0 and dst in i1, i2, i3
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+            const int64_t i13 = i03 % ne13;
+            const int64_t i12 = i02 % ne12;
+            const int64_t i11 = i01 % ne11;
+
+            float * dst_ptr  = (float *) ((char *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
+            float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+
+            for (int i0 = 0; i0 < ne0; i0++) {
+                float * src1_ptr = (float *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + i0*nb10);
+
+                dst_ptr[i0] = src0_ptr[i0] + *src1_ptr;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_add_f16_f32(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
@@ -7429,14 +7570,31 @@ static void ggml_compute_forward_add(
 static void ggml_compute_forward_add_rdma(
         const struct ggml_compute_params * params,
         const struct ggml_tensor * src0,
-        const struct ggml_tensor * src1,
+        int il,
         struct ggml_tensor * dst) {
-    // printf("src0->data =%d\n",((int8_t *)(src0->data))[0]);
-    // printf("src1->data =%f\n",((float *)(src1->data))[0]);
+            return ;
+    struct ggml_tensor * src1 =src0;
+    int idx=dst->ne[0]*dst->ne[1]*dst->ne[2]*dst->ne[3];
+    if(dst->il == 9)
+    {   
+        printf("src0->data =%f\n",((float *)(src0->data))[idx]);
+        printf("src1->data =%d\n",((int8_t *)(src1->data))[idx]);
+        printf("src0->type =%d\n",src0->type); //0
+        printf("src1->type =%d\n",src1->type); //18
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_add_f32(params, src0, src1, dst);
+            {   
+                // if(src1=GGML_TYPE_I8)
+                // {
+                //     ggml_compute_forward_add_f32_INT_8(params, src0, src1, dst);
+                // }
+                // else
+                {
+                    ggml_compute_forward_add_f32(params, src0, src1, dst);
+
+                }
             } break;
         case GGML_TYPE_F16:
             {
@@ -7468,7 +7626,10 @@ static void ggml_compute_forward_add_rdma(
                 GGML_ASSERT(false);
             } break;
     }
-    // printf("rdma->data =%f\n",((float *)(dst->data))[0]);
+    if(dst->il == 9){
+            printf("rdma->data =%f\n",((float *)(dst->data))[idx]);
+
+    }
 
     // printf("src0->type =%d\n",src0->type);
     // printf("src1->type =%d\n",src1->type);
@@ -15143,9 +15304,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 //     printf("ggml_cuda_add\n");
                 // }
                 // printf("dst->name %s \n", ggml_get_name(tensor));
-                ggml_compute_forward_add_rdma(params, tensor->src[0], tensor->src[1], tensor);
+                ggml_compute_forward_add_rdma(params, tensor->src[0], tensor->il, tensor);
             } break;
          case GGML_OP_TEST: 
+            {   printf("GGML_OP_TEST\n");
+                ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
+            } break; 
+         case GGML_OP_THRESHOLD: 
             {   printf("GGML_OP_TEST\n");
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break; 
@@ -16975,7 +17140,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_ADD:
-        case GGML_OP_ADD_RDMA:
         case GGML_OP_CREATE_BY_RDMA: //暂时 TODO
         case GGML_OP_ADD1:
         case GGML_OP_ACC:
@@ -16994,6 +17158,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_REPEAT:
         case GGML_OP_ASSIGN: //暂时 TODO
         case GGML_OP_REPEAT_BACK:
+        case GGML_OP_ADD_RDMA:
+        case GGML_OP_THRESHOLD:
             {
                 n_tasks = 1;
             } break;
@@ -17568,6 +17734,7 @@ struct ggml_cplan ggml_graph_plan(struct ggml_cgraph * cgraph, int n_threads) {
             case GGML_OP_ADD1:
                 {
                     n_tasks = n_threads;
+                    n_tasks = 1; //暂时为1
 
                     if (ggml_is_quantized(node->src[0]->type)) {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
@@ -19818,7 +19985,7 @@ struct gguf_context * gguf_init_empty_sparse(void) {
 }
 
 struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params) {
-    FILE * file = fopen(fname, "rb");
+    FILE * file = fopen(fname, "rb"); //修改这里
     if (!file) {
         return NULL;
     }

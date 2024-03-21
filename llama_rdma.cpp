@@ -1872,7 +1872,7 @@ struct llama_model_loader {
             /*.ctx      = */ &ctx_meta,
         };
 
-        ctx_gguf = gguf_init_from_file(fname.c_str(), params);
+        ctx_gguf = gguf_init_from_file(fname.c_str(), params); //修改这里即可
         if (!ctx_gguf) {
             throw std::runtime_error(format("%s: failed to load model from %s\n", __func__, fname.c_str()));
         }
@@ -2084,7 +2084,7 @@ struct llama_model_loader {
         return gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, idx);
     }
 
-    void load_data_for(struct ggml_tensor * cur) const {//给data赋值
+    void load_data_for(struct ggml_tensor * cur) const {
         const size_t offs = file_offset(ggml_get_name(cur));
 
         if (use_mmap) {
@@ -2093,7 +2093,6 @@ struct llama_model_loader {
             file.seek(offs, SEEK_SET);
             file.read_raw(cur->data, ggml_nbytes(cur));
         }
-        //通过 file.seek 设置文件指针到计算出的偏移量 offs。然后，调用 file.read_raw 方法将数据从文件读取到 cur->data 指向的内存中。读取的字节数量由 ggml_nbytes(cur) 确定，它可能是基于张量的尺寸和数据类型计算出的总字节大小。
     }
 
     void load_all_data(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
@@ -2135,7 +2134,7 @@ struct llama_model_loader {
                 #endif
             }
 
-            load_data_for(cur); //给data赋值
+            load_data_for(cur);
 
             switch (cur->backend) {
                 case GGML_BACKEND_CPU:
@@ -2908,7 +2907,6 @@ struct llama_augmentation_model_loader {
         GGML_ASSERT(0 < gpu_rows && gpu_rows <= src->ne[1]);
 
         ggml_set_no_alloc(aux_ctx, true);
-        // printf("%s row_len: %ld, gpu_rows: %ld\n", __func__, row_len, gpu_rows);
         ggml_tensor * gpu_dst = ggml_new_tensor_2d(aux_ctx, src->type, row_len, gpu_rows);
         ggml_set_backend(gpu_dst, GGML_BACKEND_GPU);
         ggml_cuda_alloc_tensor(gpu_dst);
@@ -4508,7 +4506,7 @@ static struct ggml_tensor * llm_build_sparse_mul_mat(
 #ifdef GGML_USE_CUBLAS
     // Full offloading fast path
     if (full_gpu) {
-        // printf("%s: full_gpu\n", __func__);
+        printf("%s: full_gpu\n", __func__);
         GGML_ASSERT(up_gpu && "full_gpu but no up_gpu");
         out = ggml_mul_mat_idx(ctx, up_gpu, inp, idx, NULL);
         ggml_cuda_assign_buffers_no_alloc(out);
@@ -4719,9 +4717,6 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     idx = ggml_relu(ctx, idx);
     cb(idx, "mlp_pre_relu");
     idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,up,gpu_bucket,up_gpu,il,layer);
-    ggml_tensor *idx_threshold = ggml_threshold(ctx, idx);
-    cb(idx_threshold, "idx_threshold");
-    // printf("idx: %d\n", idx->backend);
     // If the FFN layer is not fully offloaded, we need to transfer the sparsity index
     // back to the CPU to avoid synchronization issues.
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
@@ -4731,7 +4726,7 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     // cb(rdma_idx, "rdma_idx");
     if(idx->ne[1]==tensor->ne[1])
     {
-        // ggml_add(ctx,idx,tensor);
+        ggml_add(ctx,idx,tensor);
     }
     // printf_dim(rdma_idx);
     // printf_dim(idx);
@@ -4740,12 +4735,8 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     // struct ggml_tensor * rdma_idx = ggml_add_rdma(ctx,idx,rdma_idx_vec,il);
     //     cb(rdma_idx, "rdma_idx");
     // }
-    // printf("start\n");
-    up_gpu = ggml_assign(ctx, gpu_bucket, up_gpu,idx_threshold,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
-    // printf("up_gpu: %d\n", up_gpu->backend);//CPU
-    // ggml_cuda_assign_buffers_no_alloc(up_gpu);
-    (full_gpu ? cb : cb_outer)(up_gpu, "up_gpu_rdma");
-    // printf("end\n");
+    up_gpu = ggml_assign(ctx, gpu_bucket, up_gpu,idx,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
+    cb(up_gpu, "up_gpu_1");
     // up_gpu->extra = layer->ffn_up_gpu->extra;
     // if(il == 0)
     // {
@@ -5107,8 +5098,7 @@ struct llm_build_context {
                         model.layers[il].ffn_down_t,
                         model.layers[il].mlp_pre_w1,
                         model.layers[il].mlp_pre_w2,
-                        // ffn_inp, // as for now, llama's pred use the same input as the ffn
-                         inpSA, // as for now, llama's pred use the last input as the ffn
+                        ffn_inp, // as for now, llama's pred use the same input as the ffn
                         model.layers[il].gpu_idx, 
                         model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,layer, 
                         LLM_FFN_RELU, LLM_FFN_PAR, model.layers[il].gpu_offload_ratio, cbs,il);

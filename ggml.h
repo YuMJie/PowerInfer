@@ -203,10 +203,11 @@
 #else
 #    define GGML_ATTRIBUTE_FORMAT(...) __attribute__((format(printf, __VA_ARGS__)))
 #endif
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdlib.h>
+
 #ifdef __cplusplus
   #include <atomic>
   using std::atomic_int;
@@ -319,7 +320,6 @@ extern "C" {
 #else
     typedef uint16_t ggml_fp16_t;
 #endif
-
     // convert FP16 <-> FP32
     GGML_API float       ggml_fp16_to_fp32(ggml_fp16_t x);
     GGML_API ggml_fp16_t ggml_fp32_to_fp16(float x);
@@ -470,7 +470,8 @@ extern "C" {
         GGML_OP_COUNT,
         GGML_OP_TEST,
         GGML_OP_ASSIGN,
-        GGML_OP_CREATE_BY_RDMA
+        GGML_OP_CREATE_BY_RDMA,
+        GGML_OP_THRESHOLD
     };
 
     enum ggml_unary_op {
@@ -821,11 +822,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
-GGML_API struct ggml_tensor * ggml_add_rdma(
-        struct ggml_context * ctx,
-        struct ggml_tensor * a,
-        struct ggml_tensor * b,
-        bool inplace);
+
+// GGML_API void init_rdma_idx
+//         (int num_layer,struct ggml_context *aux_ctx,int dim);
+   
+        GGML_API struct ggml_tensor * ggml_add_rdma(
+                struct ggml_context * ctx,
+                struct ggml_tensor * a,
+                int il,
+                bool inplace );
     GGML_API struct ggml_tensor *ggml_add_idx(
             struct ggml_context *ctx,
             struct ggml_tensor *a,
@@ -1126,6 +1131,10 @@ GGML_API struct ggml_tensor * ggml_add_rdma(
         struct ggml_tensor  * down_gpu,
         struct ggml_tensor  * up_gpu,
         int il, const struct  llama_layer * layer );
+GGML_API struct ggml_tensor * ggml_threshold(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a
+        );
     GGML_API struct ggml_tensor *ggml_mul_mat_idx(
             struct ggml_context *ctx,
             struct ggml_tensor *a,
@@ -2251,7 +2260,8 @@ GGML_API struct ggml_tensor * ggml_add_rdma(
     // global variables
     // 
     // TODO: these should be moved to the context
-    extern float sparse_pred_threshold;
+    extern float sparse_pred_threshold;  
+    extern void* rdma_idx_vec;
 
     //
     // Internal types and functions exposed for tests and benchmarks

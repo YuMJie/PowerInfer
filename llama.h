@@ -48,7 +48,6 @@
 // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
 #define LLAMA_SUPPORTS_GPU_OFFLOAD
 #endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -770,6 +769,7 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
+
 
 // Internal API to be implemented by llama.cpp and used by tests/benchmarks only
 #ifdef LLAMA_API_INTERNAL

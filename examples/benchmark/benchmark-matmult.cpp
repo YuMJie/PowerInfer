@@ -58,6 +58,80 @@ struct benchmark_params_struct {
     int32_t n_iterations  = 10;
 };
 
+void printf_value(ggml_tensor * tensor )
+{
+    int ne0=tensor->ne[0];
+    int ne1=tensor->ne[1];
+    int ne2=tensor->ne[2];
+    int ne3=tensor->ne[3];
+    for(int i=0;i<ne3;i++)
+    {
+        for(int j=0;j<ne2;j++)
+        {
+            for(int k=0;k<ne1;k++)
+            {
+                for(int l=0;l<ne0;l++)
+                {
+                    printf("%f ",ggml_get_f32_nd(tensor,l,k,j,i));
+                }
+            }
+
+        }
+    }
+}
+void printf_nb(ggml_tensor * tensor )
+{
+    int ne0=tensor->nb[0];
+    int ne1=tensor->nb[1];
+    int ne2=tensor->nb[2];
+    int ne3=tensor->nb[3];
+    printf("nb: %i %i %i %i\n",ne0,ne1,ne2,ne3);
+}
+
+// void gpu_to_host(ggml_tensor * tensor)
+// {   int g_main_device =0 ;
+//     size_t size = tensor->ne[0]*tensor->ne[1]*tensor->ne[2]*tensor->ne[3]*ggml_type_sizef(tensor->type);
+//     cudaMemcpyAsync(tensor->data, tensor->extra[0],size, cudaMemcpyDeviceToHost);
+
+// }
+
+void printf_set(ggml_tensor * tensor)
+{
+    int ne0=tensor->ne[0];
+    int ne1=tensor->ne[1];
+    int ne2=tensor->ne[2];
+    int ne3=tensor->ne[3];
+    for(int i=0;i<ne3;i++)
+    {
+        for(int j=0;j<ne2;j++)
+        {
+            for(int k=0;k<ne1;k++)
+            {
+                for(int l=0;l<ne0;l++)
+                {
+                 void * data   = (char *) tensor->data + l*tensor->nb[0] + k*tensor->nb[1] + j*tensor->nb[2] + i*tensor->nb[3];
+                int idx =l*tensor->nb[0] + k*tensor->nb[1] + j*tensor->nb[2] + i*tensor->nb[3];
+                idx /=4;
+                switch (tensor->type) {
+                    case GGML_TYPE_I8:
+                         ((int8_t *) data)[0]=idx;
+                    case GGML_TYPE_I16:
+                         ((int16_t *) data)[0]=idx;
+                    case GGML_TYPE_I32:
+                         ((int32_t *) data)[0]=idx;
+                    // case GGML_TYPE_F16:
+                    //     return GGML_FP16_TO_FP32(((ggml_fp16_t *) data)[0]);
+                    case GGML_TYPE_F32:
+                         ((float *) data)[0]=idx;
+                         break;
+                    default:
+                        GGML_ASSERT(false);
+                }
+                }
+            }
+        }
+    }
+}
 static void print_usage(int /*argc*/, char ** argv, struct benchmark_params_struct params) {
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
     fprintf(stderr, "\n");
@@ -109,9 +183,9 @@ int main(int argc, char ** argv)  {
 
 #undef VERBOSE_DEBUGGING
 #ifndef VERBOSE_DEBUGGING
-    const int sizey = 4096;
-    const int sizex = 11008;
-    const int sizez = 128;
+    const int sizey = 2;
+    const int sizex = 3;
+    const int sizez = 6;
 #else
     /* Working - let's increase size */
     const int sizey = 1;
@@ -156,15 +230,29 @@ int main(int argc, char ** argv)  {
     printf("Creating new tensors\n");
     // printf("Creating new tensor m1\n");
     struct ggml_tensor * m11 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizey);
-    ggml_set_f32(m11, 1.0f);
+    ggml_set_backend(m11, GGML_BACKEND_GPU);
+    ggml_cuda_transform_tensor(m11->data, m11);
 
+    ggml_set_f32(m11, 1.0f);
+    printf_nb(m11);
+    printf_set(m11);
+    printf_value(m11);
     // printf("Creating new tensor m1\n");
     struct ggml_tensor * m12 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizey);
-    ggml_set_f32(m12, 1.5f);
+    ggml_set_backend(m12, GGML_BACKEND_GPU);
+    ggml_cuda_transform_tensor(m12->data, m12);
 
+    ggml_set_f32(m12, 1.5f);
+    printf_nb(m12);
+    printf_set(m12);
+    printf_value(m12);
     // printf("Creating new tensor m2\n");
     struct ggml_tensor * m2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizez);
+
     ggml_set_f32(m2, 2.0f);
+    printf_nb(m2);
+    printf_set(m2);
+    printf_value(m2);
 
     printf("\n------ Test 1 - Matrix Mult via F32 code\n");
     // printf("Creating new tensor m11xm2\n");
@@ -183,8 +271,14 @@ int main(int argc, char ** argv)  {
 
     ggml_graph_compute_helper(work_buffer, gf, benchmark_params.n_threads);
 
+    // ggml_cuda_to_cpu(gf->nodes[0], gf->nodes[0]);
+    printf("end\n");
     TENSOR_DUMP(gf->nodes[0]);
+    // printf("gf->nodes[0]->backend=%i\n",gf->nodes[0]->backend);
+    // ggml_cuda_copy_to_host(gf->nodes[0]);
 
+    printf_value(gf->nodes[0]);
+    return 0;
     printf("\n------ Test 2 - Matrix Mult via %s code\n", ggml_type_name(qtype));
 
     int32_t nelements = sizex*sizey;
@@ -194,6 +288,7 @@ int main(int argc, char ** argv)  {
     // Set up a the benchmark matrices
     // printf("Creating new tensor q11 & Running quantize\n");
     struct ggml_tensor * q11 = ggml_new_tensor_2d(ctx, qtype, sizex, sizey);
+
     ggml_quantize_chunk(qtype, (const float *) m11->data, q11->data, 0, nelements, hist_cur.data());
 
     // Set up a the compute graph
