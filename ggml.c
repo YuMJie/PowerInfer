@@ -9938,6 +9938,7 @@ static void ggml_compute_forward_mul_mat(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
               struct ggml_tensor * dst) {
+    printf("ggml_compute_forward_mul_mat\n");
     int64_t t0 = ggml_perf_time_us();
     UNUSED(t0);
 
@@ -15311,7 +15312,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break; 
          case GGML_OP_THRESHOLD: 
-            {   printf("GGML_OP_THRESHOLD\n");
+            {   
+                // printf("GGML_OP_THRESHOLD\n");
                 return ;
                 ggml_compute_forward_add(params, tensor->src[0], tensor->src[1], tensor);
             } break; 
@@ -15396,7 +15398,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_group_norm(params, tensor->src[0], tensor);
             } break;
         case GGML_OP_MUL_MAT:
-            {
+            {   
                 ggml_compute_forward_mul_mat(params, tensor->src[0], tensor->src[1], tensor);
             } break;
           

@@ -2093,6 +2093,8 @@ struct llama_model_loader {
             file.seek(offs, SEEK_SET);
             file.read_raw(cur->data, ggml_nbytes(cur));
         }
+        // free(cur->data);
+        // printf("free_data\n")
         //通过 file.seek 设置文件指针到计算出的偏移量 offs。然后，调用 file.read_raw 方法将数据从文件读取到 cur->data 指向的内存中。读取的字节数量由 ggml_nbytes(cur) 确定，它可能是基于张量的尺寸和数据类型计算出的总字节大小。
     }
 
@@ -2124,17 +2126,25 @@ struct llama_model_loader {
             if (progress_callback) {
                 progress_callback((float) done_size / size_data, progress_callback_user_data);
             }
-
+            // if(cur->data == NULL){
+            //     printf("cur->data == NULL\n"); 1
+            // }
+            // if(use_mmap){
+            //     printf("use_mmap\n"); 1
+            // }
             // allocate temp buffer if not using mmap
             if (!use_mmap && cur->data == NULL) {
                 GGML_ASSERT(cur->backend != GGML_BACKEND_CPU);
                 #ifdef GGML_USE_CPU_HBM
+                // printf("hbw_malloc\n");
                 cur->data = (uint8_t*)hbw_malloc(ggml_nbytes(cur));
                 #else
+                // printf("malloc\n"); 1
                 cur->data = (uint8_t*)malloc(ggml_nbytes(cur));
                 #endif
             }
-
+            // std::free(cur->data);
+            // printf("free_data\n");
             load_data_for(cur); //给data赋值
 
             switch (cur->backend) {
@@ -2153,7 +2163,7 @@ struct llama_model_loader {
                     // TODO: test if this works !!
                     ggml_cuda_transform_tensor(cur->data, cur);
                     if (!use_mmap) {
-                        free(cur->data);
+                        free(cur->data); // free the temporary buffer
                     }
                     break;
 #elif defined(GGML_USE_CLBLAST)
@@ -2918,7 +2928,7 @@ struct llama_augmentation_model_loader {
         static ggml_tensor * device_mat_row = ggml_dup_tensor(aux_ctx, host_mat_row);
         ggml_set_backend(device_mat_row, GGML_BACKEND_GPU);
         ggml_cuda_alloc_tensor(device_mat_row);
-        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);
+        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);//设备指针extra->data_device[0]
 
         // read raw data and copy to device depending on gpu_idx
         const enum ggml_type type = src->type;
@@ -3015,7 +3025,7 @@ struct buffered_tensor_allocator {
     ggml_tensor * buffered_alloc(const std::string & name, const llm_tensor tensor_type, const std::vector<int64_t> & ne, const int i_layer) {
 #if defined(GGML_USE_CUBLAS)
         tensor_offloading_levels level = get_offloading_level(tensor_type);
-        if (level == TENSOR_NO_OFFLOAD || level == TENSOR_OFFLOAD_FFN) {
+        if (level == TENSOR_NO_OFFLOAD || level == TENSOR_OFFLOAD_FFN) { //根据tensor_type判断是否需要offload
             return ml.create_tensor(ctx, name, ne, GGML_BACKEND_CPU);
         }
         // Alloc only metadata for GPU tensors
@@ -4740,7 +4750,7 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     //     cb(rdma_idx, "rdma_idx");
     // }
     // printf("start\n");
-    up_gpu = ggml_assign(ctx, gpu_bucket, up_gpu,idx_threshold,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
+    up_gpu = ggml_assign(ctx, up_gpu, up_gpu,idx_threshold,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
     // printf("up_gpu: %d\n", up_gpu->backend);//CPU
     // ggml_cuda_assign_buffers_no_alloc(up_gpu);
     (full_gpu ? cb : cb_outer)(up_gpu, "up_gpu_rdma");
@@ -4914,6 +4924,9 @@ static struct ggml_tensor * llm_build_kqv(
 const llm_build_cb no_offload_cb = [](struct ggml_tensor * cur, const char * name, int nl) {
     ggml_set_name(cur, name);
 };
+void free_data(void * data) {
+    free(data);
+}
 
 struct llm_build_context {
     const llama_model    & model;
@@ -5098,6 +5111,21 @@ struct llm_build_context {
                         cb(cur, "ffn_norm", il);
                     } else {
                         cbs(cur, "ffn_norm");
+                    }
+                    bool full_gpu = model.layers[il].gpu_offload_ratio >= 1.0;
+                    if(full_gpu)
+                    {   
+                        if(model.layers[il].ffn_gate->data)
+                        {
+                            printf("model.layers[il].ffn_gate->data = %f \n",((float *)(model.layers[il].ffn_gate->data))[0]);
+                            free_data(model.layers[il].ffn_gate->data);
+                        }
+                        if(model.layers[il].ffn_gate_gpu->data)
+                        {
+                            printf("model.layers[il].ffn_gate_gpu->data = %f \n",((float *)(model.layers[il].ffn_gate_gpu->data))[0]);
+                            free_data(model.layers[il].ffn_gate_gpu->data);
+                        }
+
                     }
                     cur = llm_build_ffn_sparse_rdma(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,

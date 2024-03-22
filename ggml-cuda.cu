@@ -6679,7 +6679,7 @@ void ** ggml_cuda_get_data_pp(struct ggml_tensor * tensor) {
     // only supports one device for now
     GGML_ASSERT(tensor->backend == GGML_BACKEND_GPU);
     struct ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) tensor->extra;
-    return &extra->data_device[0];
+    return &extra->data_device[0]; //得到保存设备指针的地址
 }
 
 inline void ggml_cuda_op_add(
@@ -8693,7 +8693,8 @@ void ggml_cuda_assign(const ggml_tensor * gpu_bucket, const ggml_tensor * src, g
         // dst->data=dst->src[4]->data;
         // dst->extra=dst->src[4]->extra;
         src= gpu_dst ->src[3];
-        ggml_set_backend((ggml_tensor *)src, GGML_BACKEND_GPU);
+        // ggml_set_backend((ggml_tensor *)src, GGML_BACKEND_GPU);
+        ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU); //这句要加上去，才能在full_gpu为false的时候跑通
         ggml_cuda_transform_tensor(src->data, gpu_dst);
         // // ggml_cuda_free_data(gpu_dst);
         // ggml_context * aux_ctx = gpu_dst->ctx;
@@ -8734,7 +8735,8 @@ void ggml_cuda_assign(const ggml_tensor * gpu_bucket, const ggml_tensor * src, g
         // }
         // ggml_set_no_alloc(aux_ctx, false);
         ggml_cuda_free_data(gpu_dst);
-        // gpu_dst->data=gpu_dst->src[4]->data;
+        // gpu_dst->data=gpu_dst->src[4]->data
+        // ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU);
         gpu_dst->extra=gpu_dst->src[4]->extra;
     // dst->extra = gpu_dst->extra;
     // printf("ggml_cuda_get_data_pp2 \n");
@@ -9092,6 +9094,7 @@ static void ggml_cuda_transform_tensor_impl(void * data, struct ggml_tensor * te
                 row_high -= row_high % rounding;
             }
         } else {
+            printf("tensor->name = %s\n", tensor->name);
             printf("tensor->backend = %d\n", tensor->backend);
             GGML_ASSERT(false);
         }

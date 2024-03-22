@@ -20,6 +20,52 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+ggml_tensor * create_gpu_rdma(struct ggml_context * aux_ctx,struct ggml_tensor *src, struct ggml_tensor * gpu_bucket) {
+#ifdef GGML_USE_CUBLAS
+        if (gpu_bucket == NULL) {
+            // offload the whole tensor to gpu
+            ggml_set_backend(src, GGML_BACKEND_GPU);
+            ggml_cuda_transform_tensor(src->data, src);
+            return src;
+        }
+
+        int64_t row_len = src->ne[0];
+        int64_t gpu_rows = gpu_bucket->ne[0];
+        GGML_ASSERT(0 < gpu_rows && gpu_rows <= src->ne[1]);
+
+        ggml_set_no_alloc(aux_ctx, true);
+        ggml_tensor * gpu_dst = ggml_new_tensor_2d(aux_ctx, src->type, row_len, gpu_rows);
+        ggml_set_backend(gpu_dst, GGML_BACKEND_GPU);
+        ggml_cuda_alloc_tensor(gpu_dst);
+
+        // init two 1d views on host and device
+        ggml_tensor * host_mat_row = ggml_new_tensor_1d(aux_ctx, src->type, row_len);
+        static ggml_tensor * device_mat_row = ggml_dup_tensor(aux_ctx, host_mat_row);
+        ggml_set_backend(device_mat_row, GGML_BACKEND_GPU);
+        ggml_cuda_alloc_tensor(device_mat_row);
+        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);
+
+        // read raw data and copy to device depending on gpu_idx
+        const enum ggml_type type = src->type;
+        const int ne0 = src->ne[0];
+        const size_t row_data_size = ne0*ggml_type_size(type)/ggml_blck_size(type);
+        for (int i = 0; i < gpu_rows; i++) {
+            int32_t host_i = ((int32_t *)gpu_bucket->data)[i];
+            host_mat_row -> data = (char *)(src -> data) + host_i * row_data_size;
+            char ** gpu_data_pp = reinterpret_cast<char **>(ggml_cuda_get_data_pp(device_mat_row));
+            // printf("gpu_data_p: %p\n", *gpu_data_pp);
+            ggml_cuda_cpy_1d(device_mat_row, host_mat_row);
+            *gpu_data_pp = *gpu_data_pp + row_data_size;
+        }
+        ggml_set_no_alloc(aux_ctx, false);
+
+        return gpu_dst;
+#else
+        return NULL;
+#endif
+}
+
+
 static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
     struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
 
@@ -132,6 +178,7 @@ void printf_set(ggml_tensor * tensor)
         }
     }
 }
+
 static void print_usage(int /*argc*/, char ** argv, struct benchmark_params_struct params) {
     fprintf(stderr, "usage: %s [options]\n", argv[0]);
     fprintf(stderr, "\n");
@@ -141,32 +188,6 @@ static void print_usage(int /*argc*/, char ** argv, struct benchmark_params_stru
     fprintf(stderr, "  -i N, --iter N     number of iterations to use during computation (default: %d)\n", params.n_iterations);
     fprintf(stderr, "\n");
 }
-
-// void decode(struct ggml_cgraph * gf, struct ggml_tensor * embeddings, struct ggml_tensor * res,  llama_context &  lctx)
-// {
-//     #ifdef GGML_USE_CUBLAS
-//     for (int i = 0; i < gf->n_leafs; i++) {
-//         ggml_tensor * node = gf->leafs[i];
-//         if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
-//             ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
-//             ggml_cuda_copy_to_device(node);
-//         }
-//     }
-
-//     for (int i = 0; i < gf->n_nodes; i++) {
-//         ggml_tensor * node = gf->nodes[i];
-//         if (node->backend == GGML_BACKEND_GPU && node->extra == NULL) {
-//             ggml_cuda_assign_scratch_offset(node, (char*)node->data - (char *) lctx.buf_alloc.data);
-//         }
-//     }
-
-//     // HACK: ggml-alloc may change the tensor backend when reusing a parent, so force output to be on the CPU here if needed
-//     if (!lctx.embedding.empty()) {
-//         embeddings->backend = GGML_BACKEND_CPU;
-//     }
-//     res->backend = GGML_BACKEND_CPU;
-// #endif
-// }
 
 int main(int argc, char ** argv)  {
     struct benchmark_params_struct benchmark_params;
@@ -258,29 +279,20 @@ int main(int argc, char ** argv)  {
     struct ggml_tensor * m11 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizey);
     ggml_set_backend(m11, GGML_BACKEND_GPU);
     ggml_cuda_transform_tensor(m11->data, m11);
-
+    
     ggml_set_f32(m11, 1.0f);
     printf_nb(m11);
     printf_set(m11);
     printf_value(m11);
     // printf("Creating new tensor m1\n");
-    struct ggml_tensor * m12 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizey, sizez);
+    struct ggml_tensor * m12 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizey);
     ggml_set_backend(m12, GGML_BACKEND_GPU);
     ggml_cuda_transform_tensor(m12->data, m12);
+
     ggml_set_f32(m12, 1.5f);
     printf_nb(m12);
     printf_set(m12);
     printf_value(m12);
-
-    struct ggml_tensor * m13 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizez, sizez);
-    ggml_set_backend(m13, GGML_BACKEND_GPU);
-    ggml_cuda_transform_tensor(m13->data, m13);
-    ggml_set_f32(m13, 1.5f);
-    printf_nb(m13);
-    printf_set(m13);
-    printf_value(m13);
-
-
     // printf("Creating new tensor m2\n");
     struct ggml_tensor * m2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizez);
 
@@ -292,17 +304,10 @@ int main(int argc, char ** argv)  {
     printf("\n------ Test 1 - Matrix Mult via F32 code\n");
     // printf("Creating new tensor m11xm2\n");
     struct ggml_tensor * m11xm2 = ggml_mul_mat(ctx, m11, m2);
-    printf("m11xm2_1\n");
-    struct ggml_tensor * m11xm2_1 = ggml_mul_mat(ctx, m11xm2, m12);
-    printf("m11xm2_2\n");
-
-    struct ggml_tensor * m11xm2_2 = ggml_mul_mat(ctx, m11xm2_1, m13);
-
-    // ggml_set_backend(m11xm2, GGML_BACKEND_GPU);
 
     // printf("Creating compute graph\n");
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, m11xm2_2);
+    ggml_build_forward_expand(gf, m11xm2);
 
     printf("n_threads=%i\n", benchmark_params.n_threads);
 
@@ -314,16 +319,12 @@ int main(int argc, char ** argv)  {
     ggml_graph_compute_helper(work_buffer, gf, benchmark_params.n_threads);
 
     // ggml_cuda_to_cpu(gf->nodes[0], gf->nodes[0]);
-    
-    printf("n_nodes=%i\n",gf->n_nodes);
-    printf("n_leafs=%i\n",gf->n_leafs);
-    for(int i=0;i< gf->n_nodes;i++)
-    {
-        printf("node %i\n",i);
-        TENSOR_DUMP(gf->nodes[i]);
-    }
+    printf("end\n");
+    TENSOR_DUMP(gf->nodes[0]);
+    // printf("gf->nodes[0]->backend=%i\n",gf->nodes[0]->backend);
+    // ggml_cuda_copy_to_host(gf->nodes[0]);
 
-
+    printf_value(gf->nodes[0]);
     return 0;
     printf("\n------ Test 2 - Matrix Mult via %s code\n", ggml_type_name(qtype));
 
