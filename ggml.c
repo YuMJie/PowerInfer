@@ -2615,6 +2615,19 @@ struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
     memset(tensor->data, 0, ggml_nbytes(tensor));
     return tensor;
 }
+struct ggml_tensor * ggml_set_one(struct ggml_tensor * tensor) {
+    memset(tensor->data, 1, ggml_nbytes(tensor));
+    return tensor;
+}
+struct ggml_tensor * ggml_set_zero_1(struct ggml_tensor * tensor,int start, int end) {
+    char* start_addr = (char*)tensor->data + start * ggml_type_size(tensor->type);
+    int num_bytes = (end - start + 1) * ggml_type_size(tensor->type);
+
+    memset(start_addr, 0, num_bytes);
+    return tensor;
+}
+
+
 
 struct ggml_tensor * ggml_set_i32 (struct ggml_tensor * tensor, int32_t value) {
     const int n     = ggml_nrows(tensor);

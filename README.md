@@ -115,7 +115,7 @@ cmake --build build --config Release
 ```
 
 ## Model Weights
-
+ 
 PowerInfer models are stored in a special format called *PowerInfer GGUF* based on GGUF format, consisting of both LLM weights and predictor weights.
 
 ### Download PowerInfer GGUF via Hugging Face
@@ -178,6 +178,8 @@ For CPU-only and CPU-GPU hybrid inference with all available VRAM, you can use t
 # e.g.: ./build/bin/main -m ./ReluFalcon-40B-PowerInfer-GGUF/falcon-40b-relu.q4.powerinfer.gguf -n 128 -t 8 -p "Once upon a time"
 # For Windows: .\build\bin\Release\main.exe -m .\ReluFalcon-40B-PowerInfer-GGUF\falcon-40b-relu.q4.powerinfer.gguf -n 128 -t 8 -p "Once upon a time"
 ```
+
+ ./build/bin/main -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --vram-budget 8
 
 If you want to limit the VRAM usage of GPU:
 ```bash

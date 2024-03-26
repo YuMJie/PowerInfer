@@ -99,6 +99,7 @@ option(LLAMA_QKK_64                          "llama: use super-block size of 64 
 option(LLAMA_BUILD_TESTS                "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES             "llama: build examples" ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER               "llama: build server example"                           ON)
+option(LLAMA_BUILD_RDMA              "llama: build RDMA example"                           ON)
 
 #
 # Compile flags
@@ -788,4 +789,8 @@ endif ()
 if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
+endif()
+
+if(LLAMA_BUILD_RDMA)
+    add_subdirectory(rdma-example)
 endif()

@@ -8692,10 +8692,10 @@ void ggml_cuda_assign(const ggml_tensor * gpu_bucket, const ggml_tensor * src, g
         // printf("%s \n", __func__);
         // dst->data=dst->src[4]->data;
         // dst->extra=dst->src[4]->extra;
-        src= gpu_dst ->src[3];
+        // src= gpu_dst ->src[3];
         // ggml_set_backend((ggml_tensor *)src, GGML_BACKEND_GPU);
-        ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU); //这句要加上去，才能在full_gpu为false的时候跑通
-        ggml_cuda_transform_tensor(src->data, gpu_dst);
+        // ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU); //这句要加上去，才能在full_gpu为false的时候跑通
+        // ggml_cuda_transform_tensor(src->data, gpu_dst);
         // // ggml_cuda_free_data(gpu_dst);
         // ggml_context * aux_ctx = gpu_dst->ctx;
         // int64_t row_len = src->ne[0];
@@ -8734,9 +8734,9 @@ void ggml_cuda_assign(const ggml_tensor * gpu_bucket, const ggml_tensor * src, g
         //     *gpu_data_pp = *gpu_data_pp + row_data_size;
         // }
         // ggml_set_no_alloc(aux_ctx, false);
-        ggml_cuda_free_data(gpu_dst);
+        // ggml_cuda_free_data(gpu_dst);
         // gpu_dst->data=gpu_dst->src[4]->data
-        // ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU);
+        ggml_set_backend((ggml_tensor *)gpu_dst, GGML_BACKEND_GPU);
         gpu_dst->extra=gpu_dst->src[4]->extra;
     // dst->extra = gpu_dst->extra;
     // printf("ggml_cuda_get_data_pp2 \n");
