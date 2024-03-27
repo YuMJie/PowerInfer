@@ -5,7 +5,9 @@
  */
 
 #include "rdma_common.h"
-
+#include  "llama.h"
+// #include  "ggml.c"
+#include  "ggml.h"
 /* These are basic RDMA resources */
 /* These are RDMA connection related resources */
 static struct rdma_event_channel *cm_event_channel = NULL;
@@ -26,6 +28,9 @@ static struct ibv_recv_wr server_recv_wr, *bad_server_recv_wr = NULL;
 static struct ibv_sge client_send_sge, server_recv_sge;
 /* Source and Destination buffers, where RDMA operations source and sink */
 static char *src = NULL, *dst = NULL; 
+
+struct ggml_tensor * tensor_src=NULL;
+struct ggml_tensor * tensor_dst=NULL;
 
 /* This is our testing function */
 static int check_src_dst() 
@@ -464,6 +469,25 @@ void usage() {
 	printf("(default IP is 127.0.0.1 and port is %d)\n", DEFAULT_RDMA_PORT);
 	exit(1);
 }
+struct ggml_context * ctx =NULL;
+void func_get_ctx(){
+
+    size_t ctx_size = 0;
+    ctx_size += 1*1*ggml_type_sizef(GGML_TYPE_F32);
+
+    printf("Allocating Memory of size %zi bytes, %zi MB\n",ctx_size, (ctx_size/1024/1024));
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ NULL,
+        /* no_alloc   =*/ 0
+    };
+    ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "%s: ggml_init() failed\n", __func__);
+        return ;
+    }
+}
 
 int main(int argc, char **argv) {
 	struct sockaddr_in server_sockaddr;
@@ -476,24 +500,24 @@ int main(int argc, char **argv) {
 	/* Parse Command Line Arguments */
 	while ((option = getopt(argc, argv, "s:a:p:")) != -1) {
 		switch (option) {
-			case 's':
-				printf("Passed string is : %s , with count %u \n", 
-						optarg, 
-						(unsigned int) strlen(optarg));
-				src = calloc(strlen(optarg) , 1);
-				if (!src) {
-					rdma_error("Failed to allocate memory : -ENOMEM\n");
-					return -ENOMEM;
-				}
-				/* Copy the passes arguments */
-				strncpy(src, optarg, strlen(optarg));
-				dst = calloc(strlen(optarg), 1);
-				if (!dst) {
-					rdma_error("Failed to allocate destination memory, -ENOMEM\n");
-					free(src);
-					return -ENOMEM;
-				}
-				break;
+			// case 's':
+			// 	printf("Passed string is : %s , with count %u \n", 
+			// 			optarg, 
+			// 			(unsigned int) strlen(optarg));
+			// 	src = calloc(strlen(optarg) , 1);
+			// 	if (!src) {
+			// 		rdma_error("Failed to allocate memory : -ENOMEM\n");
+			// 		return -ENOMEM;
+			// 	}
+			// 	/* Copy the passes arguments */
+			// 	strncpy(src, optarg, strlen(optarg));
+			// 	dst = calloc(strlen(optarg), 1);
+			// 	if (!dst) {
+			// 		rdma_error("Failed to allocate destination memory, -ENOMEM\n");
+			// 		free(src);
+			// 		return -ENOMEM;
+			// 	}
+			// 	break;
 			case 'a':
 				/* remember, this overwrites the port info */
 				ret = get_addr(optarg, (struct sockaddr*) &server_sockaddr);
@@ -511,6 +535,8 @@ int main(int argc, char **argv) {
 				break;
 			}
 		}
+	const int ne[4]={1,2,3,4};
+	tensor_src = ggml_new_tensor(ctx,GGML_TYPE_F32,1,ne);
 	if (!server_sockaddr.sin_port) {
 	  /* no port provided, use the default port */
 	  server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);

@@ -1,4 +1,23 @@
 # Author : Animesh Trivedi
+function(llama_build_executable source)
+    get_filename_component(TEST_TARGET ${source} NAME_WE)
+    add_executable(${TEST_TARGET} ${source})
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama common)
+endfunction()
+
+function(llama_test_executable name source)
+    get_filename_component(TEST_TARGET ${source} NAME_WE)
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${TEST_TARGET}> ${ARGN})
+endfunction()
+
+function(llama_build_and_test_executable source)
+    get_filename_component(TEST_TARGET ${source} NAME_WE)
+    add_executable(${TEST_TARGET} ${source} ${PROJECT_SOURCE_DIR}/rdma_common.c)
+    install(TARGETS ${TEST_TARGET} RUNTIME)
+    target_link_libraries(${TEST_TARGET} PRIVATE llama common )
+    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}> ${ARGN})
+endfunction()
 
 cmake_minimum_required (VERSION 2.6)
 
@@ -32,8 +51,12 @@ link_libraries(pthread ${IBVERBS_LIBRARY} ${RDMACM_LIBRARY})
 include_directories("${PROJECT_SOURCE_DIR}" "/home/atr/local/include/")
 include_directories("/home/yumj/powerinfer" "/home/atr/local/include/")
 
-add_executable(rdma_server ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server.c)
-add_executable(rdma_client ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client.c)
-add_executable(rdma_server_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server_LLM.c)
-add_executable(rdma_client_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
+# add_executable(rdma_server ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server.c)
+# add_executable(rdma_client ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client.c)
+# add_executable(rdma_server_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server_LLM.c)
+# add_executable(rdma_client_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server_LLM.c)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client.c)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server.c)
 
