@@ -1,0 +1,4 @@
+/home/yumj/rdma-example/CMakeFiles/rdma_server.dir
+/home/yumj/rdma-example/CMakeFiles/rdma_client.dir
+/home/yumj/rdma-example/CMakeFiles/edit_cache.dir
+/home/yumj/rdma-example/CMakeFiles/rebuild_cache.dir
