@@ -6,8 +6,8 @@ project (rdma-example)
 if (ACN_RDMA_DEBUG)
     add_compile_definitions(ACN_RDMA_DEBUG)
 endif()
-set(PROJECT_SOURCE_DIR ${CMAKE_SOURCE_DIR}/src)
-set(CMAKE_BINARY_DIR ${CMAKE_SOURCE_DIR}/bin)
+set(PROJECT_SOURCE_DIR ${CMAKE_SOURCE_DIR}/rdma-example/src)
+set(CMAKE_BINARY_DIR ${CMAKE_SOURCE_DIR}/rdma-example/bin)
 set(EXECUTABLE_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 set(LIBRARY_OUTPUT_PATH ${CMAKE_BINARY_DIR})
 
@@ -30,7 +30,10 @@ find_library(RDMACM_LIBRARY rdmacm HINTS /home/atr/local/lib)
 link_libraries(pthread ${IBVERBS_LIBRARY} ${RDMACM_LIBRARY})
 
 include_directories("${PROJECT_SOURCE_DIR}" "/home/atr/local/include/")
+include_directories("/home/yumj/powerinfer" "/home/atr/local/include/")
 
 add_executable(rdma_server ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server.c)
 add_executable(rdma_client ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client.c)
+add_executable(rdma_server_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_server_LLM.c)
+add_executable(rdma_client_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
 
