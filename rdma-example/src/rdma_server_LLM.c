@@ -9,6 +9,7 @@
 #include<stdio.h>
 #include "rdma_common.h"
 #include "string.h"
+#include "llama.h"
 /* These are the RDMA resources needed to setup an RDMA connection */
 /* Event channel, where connection management (cm) related events are relayed */
 static struct rdma_event_channel *cm_event_channel = NULL;
@@ -379,8 +380,8 @@ static int disconnect_and_cleanup()
 {	
 	sleep(5);
 	void * add=server_buffer_mr->addr;
-	char *str = (char *)add;
-	printf("server_buffer_mr->addr: %s\n", str);
+	float *str = (float *)add;
+	printf("server_buffer_mr->addr: %f\n", str[1]);
 	struct rdma_cm_event *cm_event = NULL;
 	int ret = -1;
        /* Now we wait for the client to send us disconnect event */

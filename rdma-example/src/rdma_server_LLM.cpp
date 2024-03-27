@@ -396,6 +396,7 @@ static int send_server_metadata_to_client()  //该函数用于向连接的客户
 	printf("Client side buffer information is received...\n");
 	show_rdma_buffer_attr(&client_metadata_attr);
 	// printf("string str %s",client_metadata_attr.str)
+	// printf("	client_metadata_attr.il[0]=%d;",client_metadata_attr.il[0]);
 	printf("The client has requested buffer length of : %u bytes \n", 
 			client_metadata_attr.length);
 	/* We need to setup requested memory buffer. This is where the client will 
@@ -569,7 +570,7 @@ static int send_server_metadata_to_client_LLM_vec()  //该函数用于向连接�
  * rdma_disconnect() and then it will clean up its resources */
 static int disconnect_and_cleanup()
 {	
-	sleep(5);
+	// sleep(1000);
 	void * add=server_buffer_mr->addr;
 	float *str = (float *)add;
 	printf("server_buffer_mr->addr: %f\n", str[1]);
@@ -645,12 +646,12 @@ void usage()
 int main(int argc, char **argv) 
 {	
 	server_buffer_mrs.resize(total);
-	server_metadata_attrs.length.resize(total);
-	server_metadata_attrs.address.resize(total);
-	server_metadata_attrs.stags.resize(total);
-	client_metadata_attrs.length.resize(total);
-	client_metadata_attrs.address.resize(total);
-	client_metadata_attrs.stags.resize(total);
+	// server_metadata_attrs.length.resize(total);
+	// server_metadata_attrs.address.resize(total);
+	// server_metadata_attrs.stags.resize(total);
+	// client_metadata_attrs.length.resize(total);
+	// client_metadata_attrs.address.resize(total);
+	// client_metadata_attrs.stags.resize(total);
 	int ret, option;
 	struct sockaddr_in server_sockaddr;
 	bzero(&server_sockaddr, sizeof server_sockaddr);
@@ -690,12 +691,12 @@ int main(int argc, char **argv)
 		rdma_error("Failed to setup client resources, ret = %d \n", ret);
 		return ret;
 	}
-	ret = accept_client_connection();
+	ret = accept_client_connection_LLM_vec();
 	if (ret) {
 		rdma_error("Failed to handle client cleanly, ret = %d \n", ret);
 		return ret;
 	}
-	ret = send_server_metadata_to_client();
+	ret = send_server_metadata_to_client_LLM_vec();
 	if (ret) {
 		rdma_error("Failed to send server metadata to the client, ret = %d \n", ret);
 		return ret;
