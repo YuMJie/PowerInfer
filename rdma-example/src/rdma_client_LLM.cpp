@@ -38,8 +38,6 @@ static struct rdma_buffer_attr_vec server_metadata_attrs;
 static struct rdma_buffer_attr_vec client_metadata_attrs;
 std::vector<struct ibv_mr *> client_src_mrs;
 std::vector<struct ibv_mr *> client_dst_mrs;
-std::vector<struct ibv_sge> client_send_sges;
-std::vector<struct ibv_recv_wr> server_recv_wrs;
 
 int total = 2;
 
@@ -79,7 +77,7 @@ static int check_src_dst_LLM_vec()
 {			
 	printf("%s\n",__func__);		
 	for(int i=0;i<total;++i)
-	{
+	{	printf("i=%d\n",i);
 		printf_value(tensor_srcs[i]);
 		printf_value(tensor_dsts[i]);
 		if(memcmp((void*) tensor_srcs[i]->data, (void*) tensor_dsts[i]->data, ggml_nbytes(tensor_dsts[i]))!=0)
@@ -324,9 +322,9 @@ static int client_connect_to_server()
 	struct rdma_cm_event *cm_event = NULL;
 	int ret = -1;
 	bzero(&conn_param, sizeof(conn_param)); //rdma_conn_param 结构体变量 conn_param，并使用 bzero() 函数将其初始化为零。这个结构体用于设置连接参数，包括 initiator_depth、responder_resources 和 retry_count。
-	conn_param.initiator_depth = 3;  //表示连接的发起者（客户端）可以同时发送的最大并发请求数。在这里，我们将其设置为 3，表示客户端可以同时发送最多 3 个请求
-	conn_param.responder_resources = 3; // responder_resources 表示连接的响应者（服务器）可以同时处理的最大并发请求数。同样地，我们将其设置为 3。
-	conn_param.retry_count = 3; // if fail, then how many times to retry
+	conn_param.initiator_depth = 6;  //表示连接的发起者（客户端）可以同时发送的最大并发请求数。在这里，我们将其设置为 3，表示客户端可以同时发送最多 3 个请求
+	conn_param.responder_resources = 6; // responder_resources 表示连接的响应者（服务器）可以同时处理的最大并发请求数。同样地，我们将其设置为 3。
+	conn_param.retry_count = 6; // if fail, then how many times to retry
 	debug("cm_client_id %p \n", cm_client_id);
 	ret = rdma_connect(cm_client_id, &conn_param); //使用 rdma_connect() 函数来发起与服务器的连接。该函数接受一个 rdma_cm_id 结构体指针 cm_client_id 和一个 rdma_conn_param 结构体指针 conn_param 作为参数。
 	if (ret) {
@@ -743,8 +741,6 @@ static int client_remote_memory_ops_LLM_vec()
 				return -ENOMEM;
 			}
 	}
-	printf_value(tensor_srcs[0]);
-
 	/* Step 1: is to copy the local buffer into the remote buffer. We will 
 	 * reuse the previous variables. */
 	/* now we fill up SGE */ 
@@ -765,15 +761,21 @@ static int client_remote_memory_ops_LLM_vec()
 		/* Now we post it */
 		ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
 				&client_send_wr,
-			&bad_client_send_wr);
+			&(bad_client_send_wr));
 		if (ret) {
 		rdma_error("Failed to write client src buffer, errno: %d \n", 
 				-errno);
 		return -errno;
 		}
-		sleep(5);
 
 	}
+		ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
+			wc, 2);
+		if(ret != 2) {
+			rdma_error("We failed to get 2 work completions , ret = %d \n",
+					ret);
+		return ret;
+		}
 	/* now we link to the send work request */ //初始化client_send_wr结构体，并设置相关参数，如SGE列表、SGE数量、操作码（IBV_WR_RDMA_WRITE）和发送标志（IBV_SEND_SIGNALED）。
 
 	// ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
@@ -782,13 +784,7 @@ static int client_remote_memory_ops_LLM_vec()
 
 	/* at this point we are expecting 1 work completion for the write */
 	printf("process_work_completion_events\n");
-	// ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
-	// 		wc, total);
-	// if(ret != total) {
-	// 	rdma_error("We failed to get 1 work completions , ret = %d \n",
-	// 			ret);
-	// 	return ret;
-	// }
+
 
 	debug("Client side WRITE is complete \n");
 	for(int i=0;i<total;++i)
@@ -814,22 +810,18 @@ static int client_remote_memory_ops_LLM_vec()
 					-errno);
 			return -errno;
 		}
+
 	/* Now we prepare a READ using same variables but for destination */ //将目标缓冲区的地址、长度和本地键赋值给client_send_sge结构体，表示接收的数据
-	sleep(5);
 	}
 
+		ret = process_work_completion_events(io_completion_channel, 
+		wc, 2);
+		if(ret != 2) {
+			printf("We failed to get 1 work completions , ret = %d \n",
+					ret);
+			return ret;
+		}
 
-	/* at this point we are expecting 1 work completion for the write */
-	
-	// ret = process_work_completion_events(io_completion_channel, 
-	// 		wc, total);
-
-
-	// if(ret != total) {
-	// 	printf("We failed to get 1 work completions , ret = %d \n",
-	// 			ret);
-	// 	return ret;
-	// }
 	debug("Client side READ is complete \n");
 	return 0;
 }
@@ -1037,7 +1029,6 @@ int main(int argc, char **argv) {
 		rdma_error("Failed to finish remote memory ops, ret = %d \n", ret);
 		return ret;
 	}
-
 	if (check_src_dst_LLM_vec()) {
 		rdma_error("src and dst buffers do not match \n");
 	} else {
