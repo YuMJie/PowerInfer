@@ -80,7 +80,7 @@ struct __attribute((packed)) rdma_buffer_attr {
 	  /* if we receive, we call it remote stag */
 	  uint32_t remote_stag;
   }stag;
-
+	uint32_t il[100];
 };
 union stag {
 	/* if we send, we call it local stags */
@@ -89,13 +89,12 @@ union stag {
 	uint32_t remote_stag;
 };
 struct __attribute((packed)) rdma_buffer_attr_vec {
-  std::vector<uint64_t> address;
-  std::vector<uint32_t> length;
-  std::vector<enum FFN_TYPE> type;
-  std::vector<std::string> name;
-  std::vector<int> il;
-  uint64_t size;
-  std::vector<stag> stags;
+  uint64_t address[100];
+  uint32_t length[100];
+  enum FFN_TYPE type[100];
+  uint8_t il[100];
+//   uint64_t size;
+  stag stags[100];
 };
 
 
@@ -105,6 +104,7 @@ int get_addr(char *dst, struct sockaddr *addr);
 
 /* prints RDMA buffer info structure */
 void show_rdma_buffer_attr(struct rdma_buffer_attr *attr);
+void show_rdma_buffer_attrs(struct rdma_buffer_attr_vec *attr);
 
 /* 
  * Processes an RDMA connection management (CM) event. 
