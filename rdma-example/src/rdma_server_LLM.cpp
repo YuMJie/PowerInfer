@@ -29,10 +29,8 @@ static struct ibv_sge client_recv_sge, server_send_sge;
 
 static struct rdma_buffer_attr_vec server_metadata_attrs;
 static struct rdma_buffer_attr_vec client_metadata_attrs;
-std::vector<struct ibv_mr *> client_src_mrs;
-std::vector<struct ibv_mr *> client_dst_mrs;
 std::vector<struct ibv_mr *> server_buffer_mrs;
-int total=1;
+int total=2;
 /* When we call this function cm_client_id must be set to a valid identifier.
  * This is where, we prepare client connection before we accept it. This 
  * mainly involve pre-posting a receive buffer to receive client side 
@@ -252,9 +250,9 @@ static int accept_client_connection()
 	 * yet because we have to do lots of resource pre-allocation */
        memset(&conn_param, 0, sizeof(conn_param)); //我们准备一个连接参数结构体conn_param，并将其初始化为零。这个结构体用于指定连接的一些参数，比如我们可以设置期望的请求深度（initiator_depth）和响应方资源数（responder_resources）
        /* this tell how many outstanding requests can we handle */
-       conn_param.initiator_depth = 3; /* For this exercise, we put a small number here */
+       conn_param.initiator_depth = 6; /* For this exercise, we put a small number here */
        /* This tell how many outstanding requests we expect other side to handle */
-       conn_param.responder_resources = 3; /* For this exercise, we put a small number */
+       conn_param.responder_resources = 6; /* For this exercise, we put a small number */
 	   //rdma_accept函数接受客户端的连接请求，并传入连接参数。
 
        ret = rdma_accept(cm_client_id, &conn_param);
@@ -337,9 +335,9 @@ static int accept_client_connection_LLM_vec()
 	 * yet because we have to do lots of resource pre-allocation */
        memset(&conn_param, 0, sizeof(conn_param)); //我们准备一个连接参数结构体conn_param，并将其初始化为零。这个结构体用于指定连接的一些参数，比如我们可以设置期望的请求深度（initiator_depth）和响应方资源数（responder_resources）
        /* this tell how many outstanding requests can we handle */
-       conn_param.initiator_depth = 3; /* For this exercise, we put a small number here */
+       conn_param.initiator_depth = 6; /* For this exercise, we put a small number here */
        /* This tell how many outstanding requests we expect other side to handle */
-       conn_param.responder_resources = 3; /* For this exercise, we put a small number */
+       conn_param.responder_resources = 6; /* For this exercise, we put a small number */
 	   //rdma_accept函数接受客户端的连接请求，并传入连接参数。
 	   	   
        ret = rdma_accept(cm_client_id, &conn_param);
@@ -493,7 +491,7 @@ static int send_server_metadata_to_client_LLM_vec()  //该函数用于向连接�
 //dma_buffer_alloc() 函数为服务器端分配内存缓冲区，并设置访问权限。
 		for(int i=0;i<total;++i)
 		{
-			    server_buffer_mrs[i] = rdma_buffer_alloc(pd /* which protection domain */, 
+			   server_buffer_mrs[i] = rdma_buffer_alloc(pd /* which protection domain */, 
 		       client_metadata_attrs.length[i] /* what size to allocate */, 
 		       (ibv_access_flags)(IBV_ACCESS_LOCAL_WRITE|
 		       IBV_ACCESS_REMOTE_READ|
