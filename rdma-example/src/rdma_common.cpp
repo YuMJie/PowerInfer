@@ -37,6 +37,19 @@ void show_rdma_buffer_attr(struct rdma_buffer_attr *attr){
 	printf("---------------------------------------------------------\n");
 }
 
+void show_rdma_buffer_attrs(struct rdma_buffer_attr_vec *attr){
+	if(!attr){
+		rdma_error("Passed attr is NULL\n");
+		return;
+	}
+	printf("---------------------------------------------------------\n");
+	printf("buffer attr, addr: %p , len: %u , stag : 0x%x \n", 
+			(void*) attr->address[0], 
+			(unsigned int) attr->length[0],
+			attr->stags[0].local_stag);
+	printf("---------------------------------------------------------\n");
+}
+
 struct ibv_mr* rdma_buffer_alloc(struct ibv_pd *pd, uint32_t size,
     enum ibv_access_flags permission) 
 {
