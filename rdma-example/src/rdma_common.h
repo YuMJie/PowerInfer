@@ -10,6 +10,7 @@
 #ifndef RDMA_COMMON_H
 #define RDMA_COMMON_H
 
+#include <iostream>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,24 +26,30 @@
 
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
-
+#include <vector>
 /* Error Macro*/
 #define rdma_error(msg, args...) do {\
-	fprintf(stderr, "%s : %d : ERROR : "msg, __FILE__, __LINE__, ## args);\
+    std::cerr << __FILE__ << " : " << __LINE__ << " : ERROR : " << msg << std::endl; \
 }while(0);
 
-#ifdef ACN_RDMA_DEBUG 
-/* Debug Macro */
-#define debug(msg, args...) do {\
-    printf("DEBUG: "msg, ## args);\
-}while(0);
+// #ifdef ACN_RDMA_DEBUG 
+// /* Debug Macro */
+// #define debug(msg, args...) do {\
+//     printf("DEBUG: "msg, ## args);\
+// }while(0);
 
-#else 
+// #else 
 
-#define debug(msg, args...) 
+// #define debug(msg, args...) 
 
-#endif /* ACN_RDMA_DEBUG */
+// #endif /* ACN_RDMA_DEBUG */
 
+template<typename... Args>
+void debug(const char* msg, Args... args) {
+    printf("DEBUG: ");
+    printf(msg, args...);
+    printf("\n");
+}
 /* Capacity of the completion queue (CQ) */
 #define CQ_CAPACITY (16)
 /* MAX SGE capacity */
@@ -58,6 +65,12 @@
  *
  * For details see: http://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  */
+enum FFN_TYPE{
+	FFN_UP,
+	FFN_DOWN,
+	FFN_GATE
+};
+
 struct __attribute((packed)) rdma_buffer_attr {
   uint64_t address;
   uint32_t length;
@@ -66,9 +79,27 @@ struct __attribute((packed)) rdma_buffer_attr {
 	  uint32_t local_stag;
 	  /* if we receive, we call it remote stag */
 	  uint32_t remote_stag;
-	  uint32_t il;
   }stag;
+
 };
+union stag {
+	/* if we send, we call it local stags */
+	uint32_t local_stag;
+	/* if we receive, we call it remote stag */
+	uint32_t remote_stag;
+};
+struct __attribute((packed)) rdma_buffer_attr_vec {
+  std::vector<uint64_t> address;
+  std::vector<uint32_t> length;
+  std::vector<enum FFN_TYPE> type;
+  std::vector<std::string> name;
+  std::vector<int> il;
+  uint64_t size;
+  std::vector<stag> stags;
+};
+
+
+
 /* resolves a given destination name to sin_addr */
 int get_addr(char *dst, struct sockaddr *addr);
 
