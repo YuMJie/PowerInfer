@@ -93,8 +93,9 @@ struct __attribute((packed)) rdma_buffer_attr_vec {
   uint32_t length[100];
   enum FFN_TYPE type[100];
   uint8_t il[100];
-//   uint64_t size;
+  uint64_t size;
   stag stags[100];
+
 };
 
 
