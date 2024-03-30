@@ -677,7 +677,7 @@ endif()
 # llama
 
 add_library(llama
-            llama.cpp
+            llama_rdma_client.cpp
             llama.h
             )
 
@@ -685,6 +685,7 @@ target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
 target_link_libraries(llama PRIVATE
     ggml
+    rdma_common # for rdma_example 将rdma_example的头文件加入到llama中
     ${LLAMA_EXTRA_LIBS}
     )
 
@@ -794,3 +795,12 @@ endif()
 if(LLAMA_BUILD_RDMA)
     add_subdirectory(rdma-example)
 endif()
+target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/rdma-example/src/)#将rdma_example的头文件加入到llama中
+
+
+#
+# rdma_common
+#
+# target_include_directories(rdma_common PUBLIC . ${LLAMA_EXTRA_INCLUDES})
+# target_compile_features(rdma_common PUBLIC c_std_11) # don't bump
+# target_link_libraries(rdma_common PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
