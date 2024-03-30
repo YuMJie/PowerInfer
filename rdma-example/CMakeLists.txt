@@ -59,6 +59,7 @@ include_directories("/home/yumj/powerinfer" "/home/atr/local/include/")
 llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server_LLM.cpp)
 llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM.cpp)
 llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM_API.cpp)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM_API.cpp)
 
 # llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client.c)
 # llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server.c)
