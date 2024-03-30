@@ -797,10 +797,3 @@ if(LLAMA_BUILD_RDMA)
 endif()
 target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/rdma-example/src/)#将rdma_example的头文件加入到llama中
 
-
-#
-# rdma_common
-#
-# target_include_directories(rdma_common PUBLIC . ${LLAMA_EXTRA_INCLUDES})
-# target_compile_features(rdma_common PUBLIC c_std_11) # don't bump
-# target_link_libraries(rdma_common PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
