@@ -82,7 +82,7 @@ struct ibv_mr *rdma_buffer_register(struct ibv_pd *pd,
 	}
 	mr = ibv_reg_mr(pd, addr, length, permission);
 	if (!mr) {
-		rdma_error("Failed to create mr on buffer, errno: %d \n", -errno);
+		printf("Failed to create mr on buffer, errno: %d %s \n", -errno,strerror(errno));
 		return NULL;
 	}
 	debug("Registered: %p , len: %u , stag: 0x%x \n", 

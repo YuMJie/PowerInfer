@@ -57,7 +57,24 @@ include_directories("/home/yumj/powerinfer" "/home/atr/local/include/")
 # add_executable(rdma_client_LLM ${PROJECT_SOURCE_DIR}/rdma_common.c ${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
 # llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM.c)
 llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server_LLM.cpp)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server_LLM_API.cpp)
 llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM.cpp)
+llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client_LLM_API.cpp)
+
 # llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_client.c)
 # llama_build_and_test_executable(${PROJECT_SOURCE_DIR}/rdma_server.c)
 
+set(TARGET rdma_common)
+
+add_library(${TARGET} 
+    ${PROJECT_SOURCE_DIR}/rdma_common.cpp
+    ${PROJECT_SOURCE_DIR}/rdma_common.h
+    )
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+target_include_directories(${TARGET} PUBLIC .)
+target_compile_features(${TARGET} PUBLIC cxx_std_11)
+target_link_libraries(${TARGET} PRIVATE llama build_info)
