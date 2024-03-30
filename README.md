@@ -107,6 +107,14 @@ Using `CMake`(3.17+):
 ```bash
 cmake -S . -B build -DLLAMA_CUBLAS=ON
 cmake --build build --config Release
+
+./build/bin/rdma_client_LLM_API -a 10.119.46.62 -s textstring
+./build/bin/rdma_server_LLM_API
+
+./build/bin/main_client -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --no-mmap --seed 0 --temp 0 
+
+./build/bin/main_server -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --no-mmap
+
 ```
 * If you have just CPU:
 ```bash

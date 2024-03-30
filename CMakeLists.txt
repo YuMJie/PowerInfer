@@ -99,7 +99,9 @@ option(LLAMA_QKK_64                          "llama: use super-block size of 64 
 option(LLAMA_BUILD_TESTS                "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES             "llama: build examples" ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER               "llama: build server example"                           ON)
-option(LLAMA_BUILD_RDMA              "llama: build RDMA example"                           ON)
+#===rdma===
+option(LLAMA_BUILD_RDMA_client              "llama: build RDMA example"                           ON)
+option(LLAMA_BUILD_RDMA_server              "llama: build RDMA example"                           OFF)
 
 #
 # Compile flags
@@ -675,12 +677,22 @@ if (BUILD_SHARED_LIBS)
 endif()
 
 # llama
-
-add_library(llama
-            llama_rdma_client.cpp
-            llama.h
-            )
-
+if(LLAMA_BUILD_RDMA_server)
+    add_library(llama
+    llama_rdma_server.cpp   
+                llama.h
+                )
+elseif(LLAMA_BUILD_RDMA_client)
+    add_library(llama
+             llama_rdma_client.cpp
+                llama.h
+                )
+else()
+    add_library(llama
+                llama.cpp
+                llama.h
+                )
+endif()
 target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
 target_link_libraries(llama PRIVATE
@@ -790,10 +802,10 @@ endif ()
 if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
-endif()
-
-if(LLAMA_BUILD_RDMA)
     add_subdirectory(rdma-example)
 endif()
+
+
+
 target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/rdma-example/src/)#将rdma_example的头文件加入到llama中
 
