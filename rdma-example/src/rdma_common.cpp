@@ -42,12 +42,15 @@ void show_rdma_buffer_attrs(struct rdma_buffer_attr_vec *attr){
 		rdma_error("Passed attr is NULL\n");
 		return;
 	}
-	printf("---------------------------------------------------------\n");
-	printf("buffer attr, addr: %p , len: %u , stag : 0x%x \n", 
-			(void*) attr->address[0], 
-			(unsigned int) attr->length[0],
-			attr->stags[0].local_stag);
-	printf("---------------------------------------------------------\n");
+	for(int i = 0; i < attr->size; i++){
+		printf("---------------------------------------------------------\n");
+		printf("buffer attr, addr: %p , len: %u , stag : 0x%x \n", 
+				(void*) attr->address[i], 
+				(unsigned int) attr->length[i],
+				attr->stags[i].local_stag);
+		printf("---------------------------------------------------------\n");
+	}
+
 }
 
 struct ibv_mr* rdma_buffer_alloc(struct ibv_pd *pd, uint32_t size,
