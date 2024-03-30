@@ -89,12 +89,12 @@ union stag {
 	uint32_t remote_stag;
 };
 struct __attribute((packed)) rdma_buffer_attr_vec {
-  uint64_t address[100];
-  uint32_t length[100];
-  enum FFN_TYPE type[100];
-  uint8_t il[100];
+  uint64_t address[400];
+  uint32_t length[400];
+  enum FFN_TYPE type[400];
+  uint8_t il[400];
   uint64_t size;
-  stag stags[100];
+  stag stags[400];
 
 };
 
