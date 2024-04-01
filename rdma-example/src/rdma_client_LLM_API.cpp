@@ -438,6 +438,15 @@ std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api_only_read
 	struct ibv_wc wc[2];
 	int ret = -1;
 	for(int i=0;i<tensor_src.size();++i){
+		        if(tensor_src[i]->data==NULL)
+        {
+            printf("tensor_src[%d]->data==NULL\n",i);
+        }
+		else
+		{
+			printf("tensor_src[%d]->data!=NULL\n",i);
+		
+		}
 	client_src_mrs[i] = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个名为client_src_mr的内存区域。这个内存区域包含了客户端要发送给服务器的数据。注册内存区域时，指定了访问权限，包括本地写入、远程读取和远程写入
 			tensor_src[i]->data,
 			ggml_nbytes(tensor_src[i]),

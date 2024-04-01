@@ -6,7 +6,6 @@
 #include "ggml.h"
 
 #include "ggml-alloc.h"
-#include "cuda_runtime.h"
 
 #ifdef GGML_USE_CUBLAS
 #  include "ggml-cuda.h"
@@ -81,10 +80,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
-#include <vector>
-#include <ctime>
 
-#include "rdma_common.h"
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -100,7 +96,7 @@
 #endif
 
 #define LLAMA_MAX_NODES 4096
-void * rdma_idx_vec;
+
 // 
 // global variables (should be removed after a better design)
 //
@@ -122,595 +118,6 @@ static void llama_log_callback_default(ggml_log_level level, const char * text, 
 // helpers
 //
 
-//=============rdma=====================
-static struct rdma_event_channel *cm_event_channel = NULL;
-static struct rdma_cm_id *cm_client_id = NULL;
-static struct ibv_pd *pd = NULL;
-static struct ibv_comp_channel *io_completion_channel = NULL;
-static struct ibv_cq *client_cq = NULL;
-static struct ibv_qp *client_qp;
-/* These are memory buffers related resources */
-static struct ibv_mr *client_metadata_mr = NULL, 
-		     *client_src_mr = NULL, 
-		     *client_dst_mr = NULL, 
-		     *server_metadata_mr = NULL;
-static struct rdma_buffer_attr client_metadata_attr, server_metadata_attr;
-static struct ibv_send_wr client_send_wr, *bad_client_send_wr = NULL;
-static struct ibv_recv_wr server_recv_wr, *bad_server_recv_wr = NULL;
-static struct ibv_sge client_send_sge, server_recv_sge;
-void printf_dim(ggml_tensor * t ,char * str ="") {
-    printf("%s:%s %s: %d %d %d %d\n", __func__, t->name, str,t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-}
-void printf_value(struct ggml_tensor * tensor,int num =10)
-{
-    int ne0=tensor->ne[0];
-    int ne1=tensor->ne[1];
-    int ne2=tensor->ne[2];
-    int ne3=tensor->ne[3];
-    for(int i=0;i<ne3;i++)
-    {
-        for(int j=0;j<ne2;j++)
-        {
-            for(int k=0;k<ne1;k++)
-            {
-                for(int l=0;l<ne0;l++)
-                {   
-                    if(--num)
-                    {
-                        printf("%f ",ggml_get_f32_nd(tensor,l,k,j,i));
-                    }
-                    else
-                    {
-                        return;
-                    }
-                }
-            }
-
-        }
-    }
-}
-
-sockaddr_in  get_server_sockaddr(char *ip, char * port) {
-	struct sockaddr_in server_sockaddr;
-	int ret, option;
-	bzero(&server_sockaddr, sizeof server_sockaddr);
-	server_sockaddr.sin_family = AF_INET;
-	server_sockaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	ret = get_addr(ip, (struct sockaddr*) &server_sockaddr);
-	if (!port) {
-	  /* no port provided, use the default port */
-	  server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);
-	}
-	else
-	{	printf("port is %s\n",port);
-	  server_sockaddr.sin_port = htons(strtol(port, NULL, 0)); 
-	}
-	if(ret) {
-		rdma_error("Invalid IP \n");
-		exit(1);
-	}
-	return server_sockaddr;
-}
-
-static int client_prepare_connection_api(struct sockaddr_in *s_addr)
-{	
-	struct rdma_cm_event *cm_event = NULL;
-	int ret = -1;
-	/*  Open a channel used to report asynchronous communication event */
-	cm_event_channel = rdma_create_event_channel();  //代码创建了一个RDMA事件通道
-	if (!cm_event_channel) {
-		rdma_error("Creating cm event channel failed, errno: %d ,.%s \n", -errno, strerror(errno));
-		exit(1);
-	}
-	debug("RDMA CM event channel is created at : %p \n", cm_event_channel);
-	/* rdma_cm_id is the connection identifier (like socket) which is used 
-	 * to define an RDMA connection. 
-	 */
-	ret = rdma_create_id(cm_event_channel, &cm_client_id,  //函数创建一个RDMA连接标识符
-			NULL,
-			RDMA_PS_TCP);
-	if (ret) {
-		rdma_error("Creating cm id failed with errno: %d \n", -errno); 
-		exit(1);
-	}
-	/* Resolve destination and optional source addresses from IP addresses  to
-	 * an RDMA address.  If successful, the specified rdma_cm_id will be bound
-	 * to a local device. */
-	ret = rdma_resolve_addr(cm_client_id, NULL, (struct sockaddr*) s_addr, 2000); //函数将目标地址解析为RDMA地址，并将cm_client_id与本地设备绑定。
-	if (ret) {
-		rdma_error("Failed to resolve address, errno: %d \n", -errno);
-		exit(1);
-	}
-	debug("waiting for cm event: RDMA_CM_EVENT_ADDR_RESOLVED\n");//process_rdma_cm_event函数等待并处理RDMA_CM_EVENT_ADDR_RESOLVED事件，该事件表示RDMA地址已解析完成
-	ret  = process_rdma_cm_event(cm_event_channel, 
-			RDMA_CM_EVENT_ADDR_RESOLVED,
-			&cm_event);
-	if (ret) {
-		rdma_error("Failed to receive a valid event, ret = %d \n", ret);
-		exit(1);
-	}
-	/* we ack the event */
-	ret = rdma_ack_cm_event(cm_event); //确认接收到的事件
-	if (ret) {
-		rdma_error("Failed to acknowledge the CM event, errno: %d\n", -errno);
-		exit(1);
-	}
-	debug("RDMA address is resolved \n");
-
-	 /* Resolves an RDMA route to the destination address in order to 
-	  * establish a connection */
-	ret = rdma_resolve_route(cm_client_id, 2000); //函数解析到目标地址的RDMA路由，以建立连接
-	if (ret) {
-		rdma_error("Failed to resolve route, erno: %d \n", -errno);
-	      exit(1);
-	}
-	debug("waiting for cm event: RDMA_CM_EVENT_ROUTE_RESOLVED\n");
-	ret = process_rdma_cm_event(cm_event_channel, 
-			RDMA_CM_EVENT_ROUTE_RESOLVED,
-			&cm_event);
-	if (ret) {
-		rdma_error("Failed to receive a valid event, ret = %d \n", ret);
-		exit(1);
-	}
-	/* we ack the event */
-	ret = rdma_ack_cm_event(cm_event);//函数确认接收到的事件
-	if (ret) {
-		rdma_error("Failed to acknowledge the CM event, errno: %d \n", -errno);
-		exit(1);
-	}
-	printf("Trying to connect to server at : %s port: %d \n", 
-			inet_ntoa(s_addr->sin_addr),
-			ntohs(s_addr->sin_port));
-	/* Protection Domain (PD) is similar to a "process abstraction" 
-	 * in the operating system. All resources are tied to a particular PD. 
-	 * And accessing recourses across PD will result in a protection fault.
-	 */
-	pd = ibv_alloc_pd(cm_client_id->verbs);//函数分配一个保护域（Protection Domain），类似于操作系统中的"进程抽象"，所有资源都与特定的保护域相关联
-	if (!pd) {
-		rdma_error("Failed to alloc pd, errno: %d \n", -errno);
-		exit(1);
-	}
-	debug("pd allocated at %p \n", pd);
-	/* Now we need a completion channel, were the I/O completion 
-	 * notifications are sent. Remember, this is different from connection 
-	 * management (CM) event notifications. 
-	 * A completion channel is also tied to an RDMA device, hence we will 
-	 * use cm_client_id->verbs. 
-	 */
-	io_completion_channel = ibv_create_comp_channel(cm_client_id->verbs); //函数创建一个完成通道（Completion Channel），用于发送I/O完成通知
-	if (!io_completion_channel) {
-		rdma_error("Failed to create IO completion event channel, errno: %d\n",
-			       -errno);
-	exit(1);
-	}
-	debug("completion event channel created at : %p \n", io_completion_channel);
-	/* Now we create a completion queue (CQ) where actual I/O 
-	 * completion metadata is placed. The metadata is packed into a structure 
-	 * called struct ibv_wc (wc = work completion). ibv_wc has detailed 
-	 * information about the work completion. An I/O request in RDMA world 
-	 * is called "work" ;) 
-	 */
-	client_cq = ibv_create_cq(cm_client_id->verbs /* which device*/,  //ibv_create_cq函数创建一个完成队列（Completion Queue），用于存放实际的I/O完成元数据
-			CQ_CAPACITY /* maximum capacity*/, 
-			NULL /* user context, not used here */,
-			io_completion_channel /* which IO completion channel */, 
-			0 /* signaling vector, not used here*/);
-	if (!client_cq) {
-		rdma_error("Failed to create CQ, errno: %d \n", -errno);
-		exit(1);
-	}
-	debug("CQ created at %p with %d elements \n", client_cq, client_cq->cqe);
-	ret = ibv_req_notify_cq(client_cq, 0); //ibv_req_notify_cq函数请求通知，以便在完成队列中有新的完成操作时得到通知
-	if (ret) {
-		rdma_error("Failed to request notifications, errno: %d\n", -errno);
-		exit(1);
-	}
-	static struct ibv_qp_init_attr qp_init_attr;
-
-       /* Now the last step, set up the queue pair (send, recv) queues and their capacity.
-         * The capacity here is define statically but this can be probed from the 
-	 * device. We just use a small number as defined in rdma_common.h */
-       bzero(&qp_init_attr, sizeof qp_init_attr);
-       qp_init_attr.cap.max_recv_sge = MAX_SGE; /* Maximum SGE per receive posting */
-       qp_init_attr.cap.max_recv_wr = MAX_WR; /* Maximum receive posting capacity */
-       qp_init_attr.cap.max_send_sge = MAX_SGE; /* Maximum SGE per send posting */
-       qp_init_attr.cap.max_send_wr = MAX_WR; /* Maximum send posting capacity */
-       qp_init_attr.qp_type = IBV_QPT_RC; /* QP type, RC = Reliable connection */
-       /* We use same completion queue, but one can use different queues */
-       qp_init_attr.recv_cq = client_cq; /* Where should I notify for receive completion operations */
-       qp_init_attr.send_cq = client_cq; /* Where should I notify for send completion operations */
-       /*Lets create a QP */
-       ret = rdma_create_qp(cm_client_id /* which connection id */,
-		       pd /* which protection domain*/,
-		       &qp_init_attr /* Initial attributes */);
-	if (ret) {
-		rdma_error("Failed to create QP, errno: %d \n", -errno);
-	       exit(1);
-	}
-	client_qp = cm_client_id->qp;
-	debug("QP created at %p \n", client_qp);
-	return 0;
-}
-
-static int client_connect_to_server() 
-{
-	struct rdma_conn_param conn_param;
-	struct rdma_cm_event *cm_event = NULL;
-	int ret = -1;
-	bzero(&conn_param, sizeof(conn_param)); //rdma_conn_param 结构体变量 conn_param，并使用 bzero() 函数将其初始化为零。这个结构体用于设置连接参数，包括 initiator_depth、responder_resources 和 retry_count。
-	conn_param.initiator_depth = 15;  //表示连接的发起者（客户端）可以同时发送的最大并发请求数。在这里，我们将其设置为 3，表示客户端可以同时发送最多 3 个请求
-	conn_param.responder_resources = 15; // responder_resources 表示连接的响应者（服务器）可以同时处理的最大并发请求数。同样地，我们将其设置为 3。
-	conn_param.retry_count = 60; // if fail, then how many times to retry
-	debug("cm_client_id %p \n", cm_client_id);
-	ret = rdma_connect(cm_client_id, &conn_param); //使用 rdma_connect() 函数来发起与服务器的连接。该函数接受一个 rdma_cm_id 结构体指针 cm_client_id 和一个 rdma_conn_param 结构体指针 conn_param 作为参数。
-	if (ret) {
-		rdma_error("Failed to connect to remote host , errno: %d\n", -errno);
-		return -errno;
-	}
-	debug("waiting for cm event: RDMA_CM_EVENT_ESTABLISHED\n");
-	ret = process_rdma_cm_event(cm_event_channel,   //process_rdma_cm_event 函数等待并处理 RDMA_CM_EVENT_ESTABLISHED 事件，该事件表示客户端与服务器的连接已建立。
-			RDMA_CM_EVENT_ESTABLISHED,
-			&cm_event);
-	if (ret) {
-		printf("Failed to get cm event, ret = %d \n", ret);
-	       return ret;
-	}
-	ret = rdma_ack_cm_event(cm_event);
-	if (ret) {
-		rdma_error("Failed to acknowledge cm event, errno: %d\n", 
-			       -errno);
-		return -errno;
-	}
-	printf("The client is connected successfully \n");
-	return 0;
-}
-static int client_pre_post_recv_buffer_LLM_vec_api_only_read(rdma_buffer_attr_vec & server_metadata_attrs)
-{
-	int ret = -1;
-
-	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
-			&server_metadata_attrs,
-			sizeof(server_metadata_attrs),
-			(IBV_ACCESS_LOCAL_WRITE));
-	if(!server_metadata_mr){
-		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
-		return -ENOMEM;
-	}
-	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
-	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
-	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
-	/* now we link it to the request */
-	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	server_recv_wr.sg_list = &server_recv_sge;
-	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr /* receive work request*/,
-		      &bad_server_recv_wr /* error WRs */);
-	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
-	}
-	debug("Receive buffer pre-posting is successful \n");
-	return 0;
-}
-
-
-std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api_only_read(std::vector<ggml_tensor *> &tensor_src,rdma_buffer_attr_vec & server_metadata_attrs )
-{	
-	std::vector<ibv_mr *> client_src_mrs(tensor_src.size());
-	struct ibv_wc wc[2];
-	int ret = -1;
-	for(int i=0;i<tensor_src.size();++i){
-        if(tensor_src[i]->data==NULL)
-        {
-            printf("tensor_src[%d]->data==NULL\n",i);
-        }
-                printf("%s i=%d\n",__func__,i);
-
-	        client_src_mrs[i] = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个名为client_src_mr的内存区域。这个内存区域包含了客户端要发送给服务器的数据。注册内存区域时，指定了访问权限，包括本地写入、远程读取和远程写入
-			tensor_src[i]->data,
-			ggml_nbytes(tensor_src[i]),
-			(ibv_access_flags)(IBV_ACCESS_LOCAL_WRITE|
-			 IBV_ACCESS_REMOTE_READ|
-			 IBV_ACCESS_REMOTE_WRITE));
-			 
-	if(!client_src_mrs[i]){
-		rdma_error("Failed to register the first buffer, ret = %d \n", ret);
-		exit(1);
-	}
-	/* we prepare metadata for the first buffer */ //
-	// client_metadata_attrs.address[i] = (uint64_t) client_src_mrs[i]->addr; 
-	// client_metadata_attrs.length[i] = client_src_mrs[i]->length; 
-	// client_metadata_attrs.stags[i].local_stag = client_src_mrs[i]->lkey;
-
-	}
-	// client_metadata_attrs.size = tensor_src.size();
-	// client_metadata_attr.stag.il = 0; 
-	/* now we register the metadata memory */
-	// client_metadata_mr = rdma_buffer_register(pd, //接下来，代码准备了第一个缓冲区的元数据。元数据包括缓冲区的地址、长度和本地标签。然后，代码调用rdma_buffer_register函数来注册一个名为client_metadata_mr的内存区域，用于存储元数据。同样地，注册内存区域时指定了访问权限。
-	// 		&client_metadata_attrs,
-	// 		sizeof(client_metadata_attrs),
-	// 		IBV_ACCESS_LOCAL_WRITE);
-
-
-	// if(!client_metadata_mr) {
-	// 	rdma_error("Failed to register the client metadata buffer, ret = %d \n", ret);
-	// 	exit(1);
-	// }
-	/* now we fill up SGE */ //然后，代码填充了一个名为client_send_sge的Scatter-Gather元素，用于指定发送工作请求的缓冲区地址、长度和本地键。接着，代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	// client_send_sge.addr = (uint64_t) client_metadata_mr->addr;
-	// client_send_sge.length = (uint32_t) client_metadata_mr->length;
-	// client_send_sge.lkey = client_metadata_mr->lkey;
-	/* now we link to the send work request */
-	// bzero(&client_send_wr, sizeof(client_send_wr)); //代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	// client_send_wr.sg_list = &client_send_sge;
-	// client_send_wr.num_sge = 1;
-	// client_send_wr.opcode = IBV_WR_SEND;
-	// client_send_wr.send_flags = IBV_SEND_SIGNALED;
-	// /* Now we post it */
-	// ret = ibv_post_send(client_qp,  //调用ibv_post_send函数将发送工作请求提交到客户端的队列中。
-	// 	       &client_send_wr,
-	//        &bad_client_send_wr);
-	// if (ret) {
-	// 	rdma_error("Failed to send client metadata, errno: %d \n", 
-	// 			-errno);
-	// 	exit(1);
-	// }
-	/* at this point we are expecting 2 work completion. One for our 
-	 * send and one for recv that we will get from the server for 
-	 * its buffer information */
-	
-	ret = process_work_completion_events(io_completion_channel, //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
-			wc, 1);
-
-	if(ret != 1) {
-		rdma_error("We failed to get 2 work completions , ret = %d \n",
-				ret);
-		exit(1);
-	}
-	debug("Server sent us its buffer location and credentials, showing \n");
-	show_rdma_buffer_attrs(&server_metadata_attrs);
-	return client_src_mrs;
-}
-
-//根据client_src_mrs和server_metadata_attrs的信息，向服务器写请求
-static int client_remote_memory_ops_LLM_vec_write_api(std::vector<ibv_mr *> client_src_mrs,rdma_buffer_attr_vec & server_metadata_attrs) 
-{	
-	int size =client_src_mrs.size();
-	struct ibv_wc wc[size];
-	int ret = -1;
-
-	/* Step 1: is to copy the local buffer into the remote buffer. We will 
-	 * reuse the previous variables. */
-	/* now we fill up SGE */ 
-	//将本地缓冲区的地址、长度和本地键（lkey）赋值给client_send_sge结构体，表示发送的数据。
-	
-	
-	for(int i=0;i<size;++i)
-	{	
-		client_send_sge.addr = (uint64_t) client_src_mrs[i]->addr;
-		client_send_sge.length = (uint32_t) client_src_mrs[i]->length;
-		client_send_sge.lkey = client_src_mrs[i]->lkey;
-		bzero(&client_send_wr, sizeof(client_send_wr));
-		client_send_wr.sg_list = &client_send_sge;
-		client_send_wr.num_sge = 1;
-		client_send_wr.opcode = IBV_WR_RDMA_WRITE;
-		client_send_wr.send_flags = IBV_SEND_SIGNALED;
-		/* we have to tell server side info for RDMA */ //设置远程RDMA操作的相关信息，包括远程键（rkey）和远程地址。
-		client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
-		client_send_wr.wr.rdma.remote_addr = server_metadata_attrs.address[i];
-		/* Now we post it */
-		ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
-				&client_send_wr,
-			&(bad_client_send_wr));
-		if (ret) {
-		printf("Failed to write client src buffer, errno: %d %s\n", 
-				-errno, strerror(errno));
-		return -errno;
-		}
-		if((i+1)%12==0)
-		{
-			ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
-			wc, 5);
-			if(ret != 5) {
-				rdma_error("We failed to get 2 work completions , ret = %d \n",
-						ret);
-			return ret;
-			}
-		}
-	}
-		ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
-		wc, size%5);
-		if(ret != size%5) {
-			rdma_error("We failed to get 2 work completions , ret = %d \n",
-					ret);
-		return ret;
-		}
-	/* now we link to the send work request */ //初始化client_send_wr结构体，并设置相关参数，如SGE列表、SGE数量、操作码（IBV_WR_RDMA_WRITE）和发送标志（IBV_SEND_SIGNALED）。
-
-	// ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
-	// 		&client_send_wr,
-	// 	&bad_client_send_wr);
-
-	/* at this point we are expecting 1 work completion for the write */
-
-	debug("Client side WRITE is complete \n");
-
-	return 0;
-}
-
-//把tensor_dst的信息注册到client_dst_mrs中
-std::vector<ibv_mr *> client_remote_memory_ops_LLM_vec_register_read_api(std::vector<ggml_tensor *> &tensor_dst) 
-{
-	struct ibv_wc wc[tensor_dst.size()];
-	int ret = -1;
-	std::vector<ibv_mr *> client_dst_mrs(tensor_dst.size());
-	for(int i=0;i<tensor_dst.size();++i)
-	{		
-		client_dst_mrs[i] = rdma_buffer_register(pd, //使用rdma_buffer_register()函数将dst缓冲区注册到RDMA设备上，并指定访问权限为本地写、远程写和远程读。
-		tensor_dst[i]->data,
-		ggml_nbytes(tensor_dst[i]),
-		(ibv_access_flags )(IBV_ACCESS_LOCAL_WRITE | 
-			IBV_ACCESS_REMOTE_WRITE | 
-			IBV_ACCESS_REMOTE_READ));
-		if (!client_dst_mrs[i]) {
-			rdma_error("We failed to create the destination buffer, -ENOMEM\n");
-			exit(1);
-		}
-	}
-	return client_dst_mrs;
-}
-
-//通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
-static int client_remote_memory_ops_LLM_vec_read_api(std::vector<ibv_mr *>& client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs) 
-{	
-	int size =client_dst_mrs.size();
-	struct ibv_wc wc[size];
-	int ret = -1;
-	/* Step 1: is to copy the local buffer into the remote buffer. We will 
-	 * reuse the previous variables. */
-	/* now we fill up SGE */ 
-	//将本地缓冲区的地址、长度和本地键（lkey）赋值给client_send_sge结构体，表示发送的数据。
-    // printf("start read\n");
-	for(int i=0;i<size;++i)
-	{    
-		client_send_sge.addr = (uint64_t) client_dst_mrs[i]->addr;
-        // printf("a4\n");
-		client_send_sge.length = (uint32_t) client_dst_mrs[i]->length;
-        // printf("a2213\n");
-		client_send_sge.lkey = client_dst_mrs[i]->lkey;
-                // printf("a2212132133\n");
-
-		/* now we link to the send work request */ //初始化client_send_wr结构体，并设置相关参数，如SGE列表、SGE数量、操作码（IBV_WR_RDMA_READ）和发送标志（IBV_SEND_SIGNALED）。
-		bzero(&client_send_wr, sizeof(client_send_wr));
-                // printf("a2\n");
-
-		client_send_wr.sg_list = &client_send_sge;
-		client_send_wr.num_sge = 1;
-		client_send_wr.opcode = IBV_WR_RDMA_READ;
-		client_send_wr.send_flags = IBV_SEND_SIGNALED;
-		/* we have to tell server side info for RDMA */ // 设置远程RDMA操作的相关信息，包括远程键和远程地址。
-		        // printf("a3\n");
-
-        client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
-		client_send_wr.wr.rdma.remote_addr = server_metadata_attrs.address[i];
-		/* Now we post it */
-        // printf("a1\n");
-
-		int ret = ibv_post_send(client_qp,  //函数将发送请求发送到RDMA队列中。
-				&client_send_wr,
-			&bad_client_send_wr);
-        // printf("ret=%d\n",ret);
-		if (ret) {
-			rdma_error("Failed to read client dst buffer from the master, errno: %d \n", 
-					-errno);
-			return -errno;
-		}
-		if((i+1)%MAX_WR==0)
-		{
-			ret = process_work_completion_events(io_completion_channel, 
-			wc, MAX_WR);
-			if(ret != MAX_WR) {
-				rdma_error("We failed to get 2 work completions , ret = %d \n",
-						ret);
-				return ret;
-			}
-		}
-	/* Now we prepare a READ using same variables but for destination */ //将目标缓冲区的地址、长度和本地键赋值给client_send_sge结构体，表示接收的数据
-	}
-	ret = process_work_completion_events(io_completion_channel, 
-	wc, size%MAX_WR);
-	if(ret != size%MAX_WR) {
-		printf("We failed to get 2 work completions , ret = %d \n",
-				ret);
-		return ret;
-	}
-	debug("Client side READ is complete \n");
-	return 0;
-}
-static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client_dst_mrs,std::vector<ibv_mr *> &client_src_mrs) 
-{	
-	size_t size =client_dst_mrs.size();
-	struct rdma_cm_event *cm_event = NULL;
-	int ret = -1;
-	/* active disconnect from the client side
-{
-	struct rdma_cm_event *cm_event = NULL;
-	int ret = -1;
-	/* active disconnect from the client side */
-	ret = rdma_disconnect(cm_client_id);
-	if (ret) {
-		rdma_error("Failed to disconnect, errno: %d \n", -errno);
-		//continuing anyways
-	}
-	ret = process_rdma_cm_event(cm_event_channel, 
-			RDMA_CM_EVENT_DISCONNECTED,
-			&cm_event);
-	if (ret) {
-		rdma_error("Failed to get RDMA_CM_EVENT_DISCONNECTED event, ret = %d\n",
-				ret);
-		//continuing anyways 
-	}
-	ret = rdma_ack_cm_event(cm_event);
-	if (ret) {
-		rdma_error("Failed to acknowledge cm event, errno: %d\n", 
-			       -errno);
-		//continuing anyways
-	}
-	/* Destroy QP */
-	rdma_destroy_qp(cm_client_id);
-	/* Destroy client cm id */
-	ret = rdma_destroy_id(cm_client_id);
-	if (ret) {
-		rdma_error("Failed to destroy client id cleanly, %d \n", -errno);
-		// we continue anyways;
-	}
-	/* Destroy CQ */
-	ret = ibv_destroy_cq(client_cq);
-	if (ret) {
-		rdma_error("Failed to destroy completion queue cleanly, %d \n", -errno);
-		// we continue anyways;
-	}
-	/* Destroy completion channel */
-	ret = ibv_destroy_comp_channel(io_completion_channel);
-	if (ret) {
-		rdma_error("Failed to destroy completion channel cleanly, %d \n", -errno);
-		// we continue anyways;
-	}
-	/* Destroy memory buffers */
-	for(int i=0;i<size;++i)
-	{
-		rdma_buffer_deregister(client_src_mrs[i]);
-		rdma_buffer_deregister(client_dst_mrs[i]);
-		
-	}
-	rdma_buffer_deregister(server_metadata_mr);
-	rdma_buffer_deregister(client_metadata_mr);	
-
-	/* We free the buffers */
-	// free(tensor_src->data);
-	// free(tensor_dst->data);
-	/* Destroy protection domain */
-	ret = ibv_dealloc_pd(pd);
-	if (ret) {
-		rdma_error("Failed to destroy client protection domain cleanly, %d \n", -errno);
-		// we continue anyways;
-	}
-	rdma_destroy_event_channel(cm_event_channel);
-	printf("Client resource clean up is complete \n");
-	return 0;
-}
-
-
-
-
-
-
-
-
-
-
-//=============rdma=====================
 static size_t utf8_len(char src) {
     const size_t lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
     uint8_t highbits = static_cast<uint8_t>(src) >> 4;
@@ -829,6 +236,7 @@ enum llm_arch {
     LLM_ARCH_REFACT,
     LLM_ARCH_BLOOM,
     LLM_ARCH_STABLELM,
+    LLM_ARCH_BAMBOO,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -845,6 +253,7 @@ static std::map<llm_arch, std::string> LLM_ARCH_NAMES = {
     { LLM_ARCH_REFACT,          "refact"    },
     { LLM_ARCH_BLOOM,           "bloom"     },
     { LLM_ARCH_STABLELM,        "stablelm"  },
+    { LLM_ARCH_BAMBOO,          "bamboo"    },
 
     { LLM_ARCH_UNKNOWN,         "unknown"   },
 };
@@ -1170,7 +579,28 @@ static std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NAMES = 
             { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
         },
     },
-
+    {
+        LLM_ARCH_BAMBOO,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,     "output_norm" },
+            { LLM_TENSOR_OUTPUT,          "output" },
+            { LLM_TENSOR_ROPE_FREQS,      "rope_freqs" },
+            { LLM_TENSOR_ATTN_NORM,       "blk.%d.attn_norm" },
+            { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
+            { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
+            { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
+            { LLM_TENSOR_ATTN_ROT_EMBD,   "blk.%d.attn_rot_embd" },
+            { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
+            { LLM_TENSOR_FFN_GATE,        "blk.%d.ffn_gate" },
+            { LLM_TENSOR_FFN_DOWN,        "blk.%d.ffn_down" },
+            { LLM_TENSOR_FFN_UP,          "blk.%d.ffn_up" },
+            { LLM_TENSOR_FFN_DOWN_T,      "blk.%d.ffn_down_t" },
+            { LLM_TENSOR_MLP_PRED_FC1,    "blk.%d.fc1" },
+            { LLM_TENSOR_MLP_PRED_FC2,    "blk.%d.fc2" },
+        },
+    },
     {
         LLM_ARCH_UNKNOWN,
         {
@@ -2665,7 +2095,7 @@ struct llama_model_loader {
         return gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, idx);
     }
 
-    void load_data_for(struct ggml_tensor * cur) const {//给data赋值
+    void load_data_for(struct ggml_tensor * cur) const {
         const size_t offs = file_offset(ggml_get_name(cur));
 
         if (use_mmap) {
@@ -2674,9 +2104,6 @@ struct llama_model_loader {
             file.seek(offs, SEEK_SET);
             file.read_raw(cur->data, ggml_nbytes(cur));
         }
-        // free(cur->data);
-        // printf("free_data\n")
-        //通过 file.seek 设置文件指针到计算出的偏移量 offs。然后，调用 file.read_raw 方法将数据从文件读取到 cur->data 指向的内存中。读取的字节数量由 ggml_nbytes(cur) 确定，它可能是基于张量的尺寸和数据类型计算出的总字节大小。
     }
 
     void load_all_data(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
@@ -2684,8 +2111,6 @@ struct llama_model_loader {
         size_t size_lock = 0;
         size_t size_pref = 0; // prefetch
 
-
-
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
             size_data += ggml_nbytes(cur);
@@ -2709,26 +2134,18 @@ struct llama_model_loader {
             if (progress_callback) {
                 progress_callback((float) done_size / size_data, progress_callback_user_data);
             }
-            // if(cur->data == NULL){
-            //     printf("cur->data == NULL\n"); 1
-            // }
-            // if(use_mmap){
-            //     printf("use_mmap\n"); 1
-            // }
+
             // allocate temp buffer if not using mmap
             if (!use_mmap && cur->data == NULL) {
                 GGML_ASSERT(cur->backend != GGML_BACKEND_CPU);
                 #ifdef GGML_USE_CPU_HBM
-                // printf("hbw_malloc\n");
                 cur->data = (uint8_t*)hbw_malloc(ggml_nbytes(cur));
                 #else
-                // printf("malloc\n"); 1
                 cur->data = (uint8_t*)malloc(ggml_nbytes(cur));
                 #endif
             }
-            // std::free(cur->data);
-            // printf("free_data\n");
-            load_data_for(cur); //给data赋值
+
+            load_data_for(cur);
 
             switch (cur->backend) {
                 case GGML_BACKEND_CPU:
@@ -2746,7 +2163,7 @@ struct llama_model_loader {
                     // TODO: test if this works !!
                     ggml_cuda_transform_tensor(cur->data, cur);
                     if (!use_mmap) {
-                        free(cur->data); // free the temporary buffer
+                        free(cur->data);
                     }
                     break;
 #elif defined(GGML_USE_CLBLAST)
@@ -2764,123 +2181,6 @@ struct llama_model_loader {
             done_size += ggml_nbytes(cur);
         }
     }
-    void load_all_data_rdma(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
-        size_t size_data = 0;
-        size_t size_lock = 0;
-        size_t size_pref = 0; // prefetch
-
-        //==========rdma==========
-        std::vector<struct ibv_mr *> client_src_mrs;
-        std::vector<struct ibv_mr *> client_dst_mrs;
-        std::vector<struct ggml_tensor *> tensor_srcs;
-        std::vector<struct ggml_tensor *> tensor_dsts;
-        std::vector<struct ggml_tensor *> tensor_result;
-        static struct rdma_buffer_attr_vec server_metadata_attrs;
-        static struct rdma_buffer_attr_vec client_metadata_attrs;
-        size_t size =gguf_get_n_tensors(ctx_gguf);
-        tensor_dsts.resize(size);	
-        tensor_srcs.resize(size);
-        client_src_mrs.resize(size);
-        client_dst_mrs.resize(size);
-        char * ip = "10.119.46.62";
-        char * port = NULL;
-        struct sockaddr_in server_sockaddr = get_server_sockaddr(ip, port);
-        //==========rdma==========
-	    client_prepare_connection_api(&server_sockaddr);
-        client_pre_post_recv_buffer_LLM_vec_api_only_read(server_metadata_attrs);
-        client_connect_to_server();
-
-        for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
-            struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
-            size_data += ggml_nbytes(cur);
-            if (cur->backend == GGML_BACKEND_CPU) {
-                size_pref += ggml_nbytes(cur);
-            }
-            tensor_dsts[i]=cur;
-
-        }
-
-        if (use_mmap) {
-            mapping.reset(new llama_mmap(&file, size_pref, ggml_is_numa()));
-            if (lmlock) {
-                lmlock->init(mapping->addr);
-            }
-        }
-
-        size_t done_size = 0;
-        for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
-            struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
-            GGML_ASSERT(cur); // unused tensors should have been caught by load_data already
-
-            if (progress_callback) {
-                progress_callback((float) done_size / size_data, progress_callback_user_data);
-            }
-                // if (!use_mmap && cur->data == NULL) {
-                // GGML_ASSERT(cur->backend != GGML_BACKEND_CPU);
-                #ifdef GGML_USE_CPU_HBM
-                // printf("hbw_malloc\n");
-                cur->data = (uint8_t*)hbw_malloc(ggml_nbytes(cur));
-                #else
-                // printf("malloc\n"); 1
-                cur->data = (uint8_t*)malloc(ggml_nbytes(cur));
-                #endif
-            
-        }
-            client_src_mrs= client_xchange_metadata_with_server_LLM_vec_api_only_read(tensor_dsts,server_metadata_attrs);
-            //计时
-            clock_t start = clock();
-            client_remote_memory_ops_LLM_vec_read_api(client_src_mrs,server_metadata_attrs);
-            std::cout << "花费了" << (double)(clock() - start) / CLOCKS_PER_SEC << "秒" << std::endl;
-            // exit(1);
-            for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
-            struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
-                // printf(cur->name);
-                // printf_dim(cur);
-               
-                // printf_value(cur);
-
-                // load_data_for(cur);
-
-            
-
-            switch (cur->backend) {
-                case GGML_BACKEND_CPU:
-                    if (use_mmap && lmlock) {
-                        size_lock += ggml_nbytes(cur);
-                        lmlock->grow_to(size_lock);
-                    }
-                    break;
-#ifdef GGML_USE_CUBLAS
-                case GGML_BACKEND_GPU:
-                case GGML_BACKEND_GPU_SPLIT:
-                    // old code:
-                    //ggml_cuda_transform_tensor(lt.data, lt.ggml_tensor);
-
-                    // TODO: test if this works !!
-                    ggml_cuda_transform_tensor(cur->data, cur);
-                    if (!use_mmap) {
-                        free(cur->data); // free the temporary buffer
-                    }
-                    break;
-#elif defined(GGML_USE_CLBLAST)
-                case GGML_BACKEND_GPU:
-                    ggml_cl_transform_tensor(cur->data, cur);
-                    if (!use_mmap) {
-                        free(cur->data);
-                    }
-                    break;
-#endif
-                default:
-                    continue;
-            }
-
-            done_size += ggml_nbytes(cur);
-        }
-
-
-    }
-
-
 };
 
 //
@@ -3024,6 +2324,7 @@ static void llm_load_hparams(
     // arch-specific KVs
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
+        case LLM_ARCH_BAMBOO:
             {
                 GGUF_GET_KEY(ctx, hparams.f_norm_rms_eps, gguf_get_val_f32, GGUF_TYPE_FLOAT32, true, kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS));
 
@@ -3451,7 +2752,8 @@ struct llama_gpu_split_loader {
 
     llama_model_loader * idx_loader;
     size_t vram_required = 0;
-    llama_gpu_split_loader(const std::string & fname, bool use_mmap) : fname(fname), use_mmap(use_mmap)  {
+
+    llama_gpu_split_loader(const std::string & fname, bool use_mmap) : fname(fname), use_mmap(use_mmap) {
         GGML_ASSERT(use_mmap);
 
         idx_loader = new llama_model_loader(fname, use_mmap);
@@ -3494,12 +2796,8 @@ struct llama_gpu_split_loader {
                 LLAMA_LOG_ERROR("%s: error: failed to load gpu index or bucket\n", __func__);
                 return 1;
             }
-
-                model_layer.gpu_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
-                // model_layer.rdma_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU); //TODO 暂时用gpu_idx
-                model_layer.gpu_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
-            
-
+            model_layer.gpu_idx = idx_loader->create_tensor_for(ctx_meta, gpu_idx, GGML_BACKEND_CPU);
+            model_layer.gpu_bucket = idx_loader->create_tensor_for(ctx_meta, gpu_bucket, GGML_BACKEND_CPU);
         }
         llama_progress_callback cb = [](float progress, void *ctx) {
             LLAMA_LOG_INFO(".");
@@ -3532,7 +2830,7 @@ struct llama_gpu_split_loader {
         return 0;
     }
 };
-   
+
 // to dynamically load/transform llama model weights
 struct llama_augmentation_model_loader {
     struct ggml_context * aux_ctx = nullptr;
@@ -3572,7 +2870,6 @@ struct llama_augmentation_model_loader {
         GGML_ASSERT(0 < gpu_rows && gpu_rows <= src->ne[1]);
 
         ggml_set_no_alloc(aux_ctx, true);
-        // printf("%s row_len: %ld, gpu_rows: %ld\n", __func__, row_len, gpu_rows);
         ggml_tensor * gpu_dst = ggml_new_tensor_2d(aux_ctx, src->type, row_len, gpu_rows);
         ggml_set_backend(gpu_dst, GGML_BACKEND_GPU);
         ggml_cuda_alloc_tensor(gpu_dst);
@@ -3582,7 +2879,7 @@ struct llama_augmentation_model_loader {
         static ggml_tensor * device_mat_row = ggml_dup_tensor(aux_ctx, host_mat_row);
         ggml_set_backend(device_mat_row, GGML_BACKEND_GPU);
         ggml_cuda_alloc_tensor(device_mat_row);
-        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);//设备指针extra->data_device[0]
+        *ggml_cuda_get_data_pp(device_mat_row) = *ggml_cuda_get_data_pp(gpu_dst);
 
         // read raw data and copy to device depending on gpu_idx
         const enum ggml_type type = src->type;
@@ -3620,13 +2917,10 @@ struct llama_augmentation_model_loader {
             layer.ffn_gate_gpu = create_striped_mat_to_gpu(layer.ffn_gate, gpu_bucket);
             offloaded_bytes += ggml_nbytes(layer.ffn_gate_gpu);
         }
+        
         layer.ffn_up_gpu = create_striped_mat_to_gpu(layer.ffn_up, gpu_bucket);
-        // struct ggml_tensor * temp  = create_striped_mat_to_gpu(layer.ffn_up, gpu_bucket);
-        // printf("create_striped_mat_to_gpu \n")
-        // ggml_cuda_free_data(temp);
-        // printf("ggml_cuda_free_data\n");
         offloaded_bytes += ggml_nbytes(layer.ffn_up_gpu);
-
+        
         layer.ffn_down_gpu = create_striped_mat_to_gpu(layer.ffn_down_t, gpu_bucket);
         offloaded_bytes += ggml_nbytes(layer.ffn_down_gpu);
 
@@ -3678,7 +2972,7 @@ struct buffered_tensor_allocator {
     ggml_tensor * buffered_alloc(const std::string & name, const llm_tensor tensor_type, const std::vector<int64_t> & ne, const int i_layer) {
 #if defined(GGML_USE_CUBLAS)
         tensor_offloading_levels level = get_offloading_level(tensor_type);
-        if (level == TENSOR_NO_OFFLOAD || level == TENSOR_OFFLOAD_FFN) { //根据tensor_type判断是否需要offload
+        if (level == TENSOR_NO_OFFLOAD || level == TENSOR_OFFLOAD_FFN) {
             return ml.create_tensor(ctx, name, ne, GGML_BACKEND_CPU);
         }
         // Alloc only metadata for GPU tensors
@@ -3747,7 +3041,7 @@ struct buffered_tensor_allocator {
 };
 
 static bool load_gpu_split_from_split_file(llama_model & model, std::string split_path, size_t vram_budget) {
-    llama_gpu_split_loader loader(split_path,true);
+    llama_gpu_split_loader loader(split_path, true);
     return loader.check_vram_allocable(vram_budget) 
         && loader.load_gpu_idx_for_model(&model) == 0;
 }
@@ -3900,6 +3194,7 @@ static void llm_load_sparse_model_tensors(
         switch (model.arch) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
+            case LLM_ARCH_BAMBOO:
                 {
                     model.tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
 
@@ -3929,12 +3224,6 @@ static void llm_load_sparse_model_tensors(
                         layer.mlp_pre_w1 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC1, "weight", i), {n_embd, GGML_NE_WILDCARD});
                         layer.mlp_pre_w2 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC2, "weight", i), {GGML_NE_WILDCARD, n_ff});
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
-                                            // ggml_set_f32(layer.ffn_up,100.f);
-                        if(layer.ffn_gate->data!=NULL && layer.mlp_pre_w1->data==NULL)
-                        {
-                            printf("layer.ffn_gate.data!=NULL && layer.mlp_pre_w1==NULL\n");
-                        }
-
                     }
                 } break;
             case LLM_ARCH_FALCON:
@@ -3997,7 +3286,7 @@ static void llm_load_sparse_model_tensors(
         model.tensors_by_name.emplace_back(ggml_get_name(cur), cur);
     }
 
-    ml.load_all_data_rdma(ctx, progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
+    ml.load_all_data(ctx, progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
 
     if (progress_callback) {
         progress_callback(1.0f, progress_callback_user_data);
@@ -4047,6 +3336,7 @@ void llama_reserve_model_kv_cache(llama_model *model, const llama_context_params
     }
 #endif
 }
+
 static void llm_load_tensors(
         llama_model_loader & ml,
         llama_model & model,
@@ -4121,6 +3411,7 @@ static void llm_load_tensors(
         switch (model.arch) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
+            case LLM_ARCH_BAMBOO:
                 {
                     model.tok_embd = ml.create_tensor(ctx, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, GGML_BACKEND_CPU);
 
@@ -4844,6 +4135,7 @@ enum llm_ffn_op_type {
 enum llm_ffn_gate_type {
     LLM_FFN_SEQ,
     LLM_FFN_PAR, // ffn_gate is parallel to ffn_up
+    LLM_FFN_SYM, // ffn_gate is parallel to ffn_up and should pass through an activation function
 };
 
 enum llm_norm_type {
@@ -4937,7 +4229,7 @@ static std::pair<ggml_tensor*, ggml_tensor*> llm_build_kv_store(
          struct ggml_cgraph * graph,
          struct ggml_tensor * k_cur,
          struct ggml_tensor * v_cur,
-                    int64_t   n_ctx, //512
+                    int64_t   n_ctx,
                     int32_t   n_tokens,
                     int32_t   kv_head,
          const llm_build_cb & cb,
@@ -4952,7 +4244,7 @@ static std::pair<ggml_tensor*, ggml_tensor*> llm_build_kv_store(
     struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k, n_tokens*n_embd_gqa,
             (ggml_element_size(kv.k)*n_embd_gqa)*(il*n_ctx + kv_head));
     cb(k_cache_view, "k_cache_view", il);
-    // printf_dim(kv.k, "kv.k"); //n_ctx*n_head*dim 1 1 1 n_ctx为最大的上下文长度
+
     struct ggml_tensor * v_cache_view = ggml_view_2d(ctx, kv.v, n_tokens, n_embd_gqa,
             (   n_ctx)*ggml_element_size(kv.v),
             (il*n_ctx)*ggml_element_size(kv.v)*n_embd_gqa + kv_head*ggml_element_size(kv.v));
@@ -4960,9 +4252,6 @@ static std::pair<ggml_tensor*, ggml_tensor*> llm_build_kv_store(
 
     // important: storing RoPE-ed version of K in the KV cache!
     ggml_tensor * k_cpy = ggml_cpy(ctx, k_cur,   k_cache_view);
-    // printf_dim(k_cur, "k_cur"); //k_dim n_head 1 1
-    // printf_dim(k_cache_view, "k_cache_view"); //k_dim*n_head 1 1
-
     ggml_tensor * v_cpy = ggml_cpy(ctx, v_cur_t, v_cache_view);
     //ggml_build_forward_expand(graph, ggml_cpy(ctx, k_cur,   k_cache_view));
     //ggml_build_forward_expand(graph, ggml_cpy(ctx, v_cur_t, v_cache_view));
@@ -5031,6 +4320,7 @@ static struct ggml_tensor * llm_build_ffn(
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
+            case LLM_FFN_SYM:
                 {
                     cur = ggml_mul_mat(ctx, gate, cur);
                     cb(cur, "ffn_gate", il);
@@ -5045,42 +4335,48 @@ static struct ggml_tensor * llm_build_ffn(
         cur = tmp;
     }
 
-    switch (type_op) {
-        case LLM_FFN_SILU:
-            {
-                cur = ggml_silu(ctx, cur);
-                cb(cur, "ffn_silu", il);
-            } break;
-        case LLM_FFN_GELU:
-            {
-                cur = ggml_gelu(ctx, cur);
-                cb(cur, "ffn_gelu", il);
-            } break;
-        case LLM_FFN_RELU:
-            {
-                cur = ggml_relu(ctx, cur);
-                cb(cur, "ffn_relu", il);
-            } break;
-        case LLM_FFN_RELU_SQR:
-            {
-                cur = ggml_relu(ctx, cur);
-                cb(cur, "ffn_relu", il);
+    auto act_fn = [&] (ggml_tensor * cur) {
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                {
+                    cur = ggml_silu(ctx, cur);
+                    cb(cur, "ffn_silu", il);
+                } break;
+            case LLM_FFN_GELU:
+                {
+                    cur = ggml_gelu(ctx, cur);
+                    cb(cur, "ffn_gelu", il);
+                } break;
+            case LLM_FFN_RELU:
+                {
+                    cur = ggml_relu(ctx, cur);
+                    cb(cur, "ffn_relu", il);
+                } break;
+            case LLM_FFN_RELU_SQR:
+                {
+                    cur = ggml_relu(ctx, cur);
+                    cb(cur, "ffn_relu", il);
 
-                cur = ggml_sqr(ctx, cur);
-                cb(cur, "ffn_sqr(relu)", il);
-            } break;
+                    cur = ggml_sqr(ctx, cur);
+                    cb(cur, "ffn_sqr(relu)", il);
+                } break;
+        }
+
+        return cur;
+    };
+
+    cur = act_fn(cur);
+    if (type_gate == LLM_FFN_SYM) {
+        // In this case, the output of up is also activated
+        tmp = act_fn(tmp);
     }
 
-    if (type_gate == LLM_FFN_PAR) {
+    if (type_gate == LLM_FFN_PAR || type_gate == LLM_FFN_SYM) {
         cur = ggml_mul(ctx, cur, tmp);
         cb(cur, "ffn_gate_par", il);
     }
 
-    // cur = ggml_mul_mat(ctx, down, cur);
-    cur = ggml_axpy(ctx, down, cur, NULL, NULL);
-    if (down_b) {
-        cb(cur, "ffn_down", il);
-    }
+    cur = ggml_mul_mat(ctx, down, cur);
 
     if (down_b) {
         cur = ggml_add(ctx, cur, down_b);
@@ -5106,7 +4402,6 @@ static struct ggml_tensor * llm_build_sparse_mul_mat(
 #ifdef GGML_USE_CUBLAS
     // Full offloading fast path
     if (full_gpu) {
-        // printf("%s: full_gpu\n", __func__);
         GGML_ASSERT(up_gpu && "full_gpu but no up_gpu");
         out = ggml_mul_mat_idx(ctx, up_gpu, inp, idx, NULL);
         ggml_cuda_assign_buffers_no_alloc(out);
@@ -5120,13 +4415,9 @@ static struct ggml_tensor * llm_build_sparse_mul_mat(
 
 #ifdef GGML_USE_CUBLAS
     if (up_gpu) {
-        // printf_dim(up_gpu);
-        // printf_dim(inp);
         ggml_tensor * out_gpu = ggml_mul_mat_idx_upscale(ctx, up_gpu, inp, idx, gpu_bucket, out->ne[0]);
         ggml_cuda_assign_buffers_no_alloc(out_gpu);
-        // printf_dim(out_gpu, "out_gpu");
         cb(out_gpu, (full_name + "_gpu").c_str());
-        // printf_dim(out_gpu);
         out = ggml_add(ctx, out, out_gpu);
         // We don't need to assign buffers here, as the output will be passed into Axpy,
         // which in this case, is also a hybrid operation.
@@ -5187,9 +4478,8 @@ static struct ggml_tensor * llm_build_ffn_sparse(
          struct ggml_tensor * up_b,
          struct ggml_tensor * gate,
          struct ggml_tensor * gate_b,
-         struct ggml_tensor * down,
-         struct ggml_tensor * down_b,
          struct ggml_tensor * down_t,
+         struct ggml_tensor * down_b,
          struct ggml_tensor * pre_w1,
          struct ggml_tensor * pre_w2,
          struct ggml_tensor * pred_inpl,
@@ -5204,13 +4494,14 @@ static struct ggml_tensor * llm_build_ffn_sparse(
    const llm_build_cb_short & cb_outer) {
     bool full_gpu = gpu_offload_ratio >= 1.0;
     ggml_tensor * ffn_input = cur;
-    llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * cur, const char * name) {
-        cb_outer(cur, name);
+
+    llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * tensor, const char * name) {
+        cb_outer(tensor, name);
 #if defined(GGML_USE_CUBLAS)
         // Determine offloading based on src[0] (weight for both mul and axpy)
-        bool operates_on_gpu = cur->src[0]->backend == GGML_BACKEND_GPU;
+        bool operates_on_gpu = tensor->src[0]->backend == GGML_BACKEND_GPU;
         if (operates_on_gpu) {
-            ggml_cuda_assign_buffers_no_alloc(cur);
+            ggml_cuda_assign_buffers_no_alloc(tensor);
         }
 #endif
     };
@@ -5225,138 +4516,56 @@ static struct ggml_tensor * llm_build_ffn_sparse(
     // back to the CPU to avoid synchronization issues.
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
 
-    // FFN up
-    struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);
-    if (up_b) {
-        up_out = ggml_add(ctx, up_out, up_b);
-        cb(up_out, "ffn_up_b");
-    }
-
-    if (gate) {
-        // TODO: only support par for now
-        GGML_ASSERT(type_gate == LLM_FFN_PAR);
-        ggml_tensor * gate_out = llm_build_sparse_mul_mat(ctx, gate, ffn_input, idx, gate_gpu, gpu_index, gpu_bucket, cb_outer, "gate", full_gpu);
-        if (gate_b) {
-            gate_out = ggml_add(ctx, gate_out, gate_b);
-            cb(gate_out, "ffn_gate_b");
+    auto act_fn = [&](ggml_tensor * tensor, const char * name) {
+        switch (type_op) {
+            case LLM_FFN_RELU:
+                {
+                    tensor = ggml_relu(ctx, tensor);
+                    cb(tensor, name);
+                } break;
+            default:
+                GGML_ASSERT(false && "unsupported activation function");
         }
-        cur = gate_out;
-    } else {
-        cur = up_out;
-    }
-
-    switch (type_op) {
-        case LLM_FFN_RELU:
-            {
-                cur = ggml_relu(ctx, cur);
-                cb(cur, "ffn_relu");
-            } break;
-        default:
-            // only support relu for now
-            GGML_ASSERT(type_op == LLM_FFN_RELU);
-    }
-
-    if (type_gate == LLM_FFN_PAR) {
-        cur = ggml_mul(ctx, cur, up_out);
-        cb(cur, "ffn_gate_par");
-    }
-
-    cur = llm_build_sparse_axpy(ctx, down_t, cur, idx, down_gpu, gpu_index, gpu_bucket, cb_outer, "down", full_gpu);
-
-    if (down_b) {
-        cur = ggml_add(ctx, cur, down_b);
-        cb(cur, "ffn_down_b");
-    }
-
-    return cur;
-}
-
-static struct ggml_tensor * llm_build_ffn_sparse_rdma(
-        struct ggml_context * ctx,
-         struct ggml_tensor * cur,
-         struct ggml_tensor * up,
-         struct ggml_tensor * up_b,
-         struct ggml_tensor * gate,
-         struct ggml_tensor * gate_b,
-         struct ggml_tensor * down,
-         struct ggml_tensor * down_b,
-         struct ggml_tensor * down_t,
-         struct ggml_tensor * pre_w1,
-         struct ggml_tensor * pre_w2,
-         struct ggml_tensor * pred_inpl,
-         struct ggml_tensor * gpu_index,
-         struct ggml_tensor * gpu_bucket,
-         struct ggml_tensor * gate_gpu,
-         struct ggml_tensor * down_gpu,
-         struct ggml_tensor * up_gpu,
-        //  struct ggml_tensor * rdma_idx,
-        //  struct ggml_tensor * rdma_bucket,
-         const struct llama_layer * layer,
-            llm_ffn_op_type   type_op,
-          llm_ffn_gate_type   type_gate,
-                     double   gpu_offload_ratio,
-   const llm_build_cb_short & cb_outer,int &il
-   ) {
-    // printf("%s",__func__);
-    bool full_gpu = gpu_offload_ratio >= 1.0;
-    ggml_tensor * ffn_input = cur;
-    llm_build_cb_short cb = [&cb_outer](struct ggml_tensor * cur, const char * name) {
-        cb_outer(cur, name);
-#if defined(GGML_USE_CUBLAS)
-        // Determine offloading based on src[0] (weight for both mul and axpy)
-        bool operates_on_gpu = cur->src[0]->backend == GGML_BACKEND_GPU;
-        if (operates_on_gpu) {
-            ggml_cuda_assign_buffers_no_alloc(cur);
-        }
-#endif
+        return tensor;
     };
 
-    // prepare sparse idx
-    ggml_tensor * idx = ggml_mul_mat(ctx, pre_w1, pred_inpl);
-    cb(idx, "mlp_pre_hidden");
-    idx = ggml_relu(ctx, idx);
-    cb(idx, "mlp_pre_relu");
-    idx = ggml_mul_mat(ctx, pre_w2, idx);
-    (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
-    // cb(rdma_idx, "rdma_idx");
-
     // FFN up
     struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);
     if (up_b) {
         up_out = ggml_add(ctx, up_out, up_b);
         cb(up_out, "ffn_up_b");
     }
-    // printf("llm_build_sparse_mul_mat\n");
+
+    struct ggml_tensor * gate_out = nullptr;
     if (gate) {
-        // TODO: only support par for now
-        GGML_ASSERT(type_gate == LLM_FFN_PAR);
-        ggml_tensor * gate_out = llm_build_sparse_mul_mat(ctx, gate, ffn_input, idx, gate_gpu, gpu_index, gpu_bucket, cb_outer, "gate", full_gpu);
+        // Only support par for now
+        GGML_ASSERT(type_gate == LLM_FFN_PAR || type_gate == LLM_FFN_SYM);
+        gate_out = llm_build_sparse_mul_mat(ctx, gate, ffn_input, idx, gate_gpu, gpu_index, gpu_bucket, cb_outer, "gate", full_gpu);
         if (gate_b) {
             gate_out = ggml_add(ctx, gate_out, gate_b);
             cb(gate_out, "ffn_gate_b");
         }
-        cur = gate_out;
-    } else {
-        cur = up_out;
     }
-    // printf("gate_llm_build_sparse_mul_mat\n");
 
-    switch (type_op) {
-        case LLM_FFN_RELU:
+    switch (type_gate) {
+        case LLM_FFN_PAR:
             {
-                cur = ggml_relu(ctx, cur);
-                cb(cur, "ffn_relu");
+                GGML_ASSERT(gate_out != nullptr);
+                ggml_tensor * act_gate = act_fn(gate_out, "ffn_gate_act");
+                cur = ggml_mul(ctx, act_gate, up_out);
+                cb(cur, "ffn_gate_par");
+            } break;
+        case LLM_FFN_SYM:
+            {
+                GGML_ASSERT(gate_out != nullptr);
+                ggml_tensor * act_gate = act_fn(gate_out, "ffn_gate_act");
+                ggml_tensor * act_up = act_fn(up_out, "ffn_up_act");
+                cur = ggml_mul(ctx, act_gate, act_up);
+                cb(cur, "ffn_gate_sym");
             } break;
         default:
-            // only support relu for now
-            GGML_ASSERT(type_op == LLM_FFN_RELU);
+            GGML_ASSERT(false && "unsupported gate type");
     }
-
-    if (type_gate == LLM_FFN_PAR) {
-        cur = ggml_mul(ctx, cur, up_out);
-        cb(cur, "ffn_gate_par");
-    }
-    // printf("ggml_mul\n");
 
     cur = llm_build_sparse_axpy(ctx, down_t, cur, idx, down_gpu, gpu_index, gpu_bucket, cb_outer, "down", full_gpu);
 
@@ -5382,18 +4591,18 @@ static struct ggml_tensor * llm_build_kqv(
          struct ggml_tensor * q_cur,
          struct ggml_tensor * kq_scale,
          struct ggml_tensor * kq_mask,
-                    int64_t   n_ctx, //512
-                    int32_t   n_tokens, //1 
-                    int32_t   n_kv, // n
+                    int64_t   n_ctx,
+                    int32_t   n_tokens,
+                    int32_t   n_kv,
                     float     max_alibi_bias,
          const llm_build_cb & cb,
                     int       il) {
-    const int64_t n_embd      = hparams.n_embd; //4096
-    const int64_t n_head      = hparams.n_head; //32
-    const int64_t n_head_kv   = hparams.n_head_kv; //32
-    const int64_t n_embd_head = hparams.n_embd_head(); //128
-    const int64_t n_embd_gqa  = hparams.n_embd_gqa(); //4096
-    // printf("%s: %d %d %d %d %d %d %d %d %d \n", __func__, n_embd, n_head, n_head_kv, n_embd_head, n_embd_gqa, n_ctx, n_tokens, n_kv, max_alibi_bias);
+    const int64_t n_embd      = hparams.n_embd;
+    const int64_t n_head      = hparams.n_head;
+    const int64_t n_head_kv   = hparams.n_head_kv;
+    const int64_t n_embd_head = hparams.n_embd_head();
+    const int64_t n_embd_gqa  = hparams.n_embd_gqa();
+
     struct ggml_tensor * q = ggml_permute(ctx, q_cur, 0, 2, 1, 3);
     cb(q, "q", il);
 
@@ -5407,13 +4616,11 @@ static struct ggml_tensor * llm_build_kqv(
     if (k_cpy != nullptr) {
         k->src[1] = k_cpy;
     }
-    // printf_dim(k);//128 token_n 32 1  ps. 128是n_embd_head 32是n_head_kv 
-    // printf_dim(q);//128 token_n 32 1
 
-    struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);  // n_kv 1 32 1
+    struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
     cb(kq, "kq", il);
-    // printf_dim(kq);
-    kq = ggml_scale(ctx, kq, kq_scale); 
+
+    kq = ggml_scale(ctx, kq, kq_scale);
     cb(kq, "kq_scaled", il);
 
     if (max_alibi_bias > 0.0f) {
@@ -5426,14 +4633,9 @@ static struct ggml_tensor * llm_build_kqv(
 
     kq = ggml_add(ctx, kq, kq_mask);
     cb(kq, "kq_masked", il);
-    // printf_dim(kq); // n_kv 1 32 1
-    kq = ggml_soft_max(ctx, kq);
 
-    // ggml_tensor * softmax_mask = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_kv);
-    // ggml_set_one(softmax_mask);
-    // ggml_set_zero_1(softmax_mask,1,n_)
-    cb(kq, "kq_soft_max", il);  // n_kv 1 32 1
-    // printf_dim(kq);
+    kq = ggml_soft_max(ctx, kq);
+    cb(kq, "kq_soft_max", il);
 
     // split cached v into n_head heads
     struct ggml_tensor * v =
@@ -5453,9 +4655,9 @@ static struct ggml_tensor * llm_build_kqv(
     struct ggml_tensor * kqv_merged = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     cb(kqv_merged, "kqv_merged", il);
 
-    struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, n_embd, n_tokens); 
-    cb(cur, "kqv_merged_cont", il); //4096 1 1 1
-    // printf_dim(cur);
+    struct ggml_tensor * cur = ggml_cont_2d(ctx, kqv_merged, n_embd, n_tokens);
+    cb(cur, "kqv_merged_cont", il);
+
     cur = ggml_mul_mat(ctx, wo, cur);
     if (wo_b) {
         cb(cur, "kqv_wo", il);
@@ -5471,9 +4673,6 @@ static struct ggml_tensor * llm_build_kqv(
 const llm_build_cb no_offload_cb = [](struct ggml_tensor * cur, const char * name, int nl) {
     ggml_set_name(cur, name);
 };
-void free_data(void * data) {
-    free(data);
-}
 
 struct llm_build_context {
     const llama_model    & model;
@@ -5568,7 +4767,7 @@ struct llm_build_context {
         }
     }
 
-    struct ggml_cgraph * build_llama() {
+    struct ggml_cgraph * build_llama_variants() {
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, LLAMA_MAX_NODES, false);
 
         GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -5588,19 +4787,17 @@ struct llm_build_context {
         cb(KQ_scale, "KQ_scale", -1);
 
         // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
-        struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1);//n_kv 1 1 1
-        // printf("KQ_mask: %d %d %d %d\n", KQ_mask->ne[0], KQ_mask->ne[1], KQ_mask->ne[2], KQ_mask->ne[3]);
+        struct ggml_tensor * KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1);
         cb(KQ_mask, "KQ_mask", -1);
-        // printf("n_kv: %d",n_kv);
+
         // shift the entire K-cache if needed
         if (do_rope_shift) {
             llm_build_k_shift(ctx0, hparams, cparams, kv_self, gf, LLM_ROPE, n_ctx, n_embd_head, freq_base, freq_scale, cb);
         }
-        // printf_dim(KQ_mask,"KQ_mask_1");
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
-            const llama_layer * layer = il ? &model.layers[il-1] :& model.layers[il];
+
             // norm
             cur = llm_build_norm(ctx0, inpL, hparams,
                     model.layers[il].attn_norm, NULL,
@@ -5634,15 +4831,12 @@ struct llm_build_context {
                 cb(Kcur, "Kcur", il);
 
                 std::tie(k_cpy, v_cpy) = llm_build_kv_store(ctx0, hparams, kv_self, gf, Kcur, Vcur, n_ctx, n_tokens, kv_head, cb, il);
-                // printf_dim(k_cpy,"k_cpy");
-                // printf_dim(v_cpy,"v_cpy");
+
                 cur = llm_build_kqv(ctx0, hparams, kv_self,
                         model.layers[il].wo, NULL,
                         Qcur, KQ_scale, KQ_mask, n_ctx, n_tokens, n_kv, -1.0f, cb, il);
                 cb(cur, "kqv_out", il);
-
             }
-                // printf_dim(KQ_mask,"KQ_mask_2");
 
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
             cb(ffn_inp, "ffn_inp", il);
@@ -5652,6 +4846,7 @@ struct llm_build_context {
                 cur = llm_build_norm(ctx0, ffn_inp, hparams,
                         model.layers[il].ffn_norm, NULL,
                         LLM_NORM_RMS, cb, il);
+                llm_ffn_gate_type gate_type = model.arch == LLM_ARCH_BAMBOO ? LLM_FFN_SYM : LLM_FFN_PAR;
 
                 if (llama_use_sparse_inference(&model)) {
                     llm_build_cb_short cbs = [&](ggml_tensor * cur, const char * name) {
@@ -5664,26 +4859,25 @@ struct llm_build_context {
                     } else {
                         cbs(cur, "ffn_norm");
                     }
-                    cur = llm_build_ffn_sparse_rdma(ctx0, cur,
-                        model.layers[il].ffn_up,   NULL,
-                        model.layers[il].ffn_gate, NULL,
-                        model.layers[il].ffn_down, NULL,
-                        model.layers[il].ffn_down_t,
-                        model.layers[il].mlp_pre_w1,
-                        model.layers[il].mlp_pre_w2,
-                        ffn_inp, // as for now, llama's pred use the same input as the ffn
-                        //  inpSA, // as for now, llama's pred use the last input as the ffn
-                        model.layers[il].gpu_idx, 
-                        model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,layer, 
-                        LLM_FFN_RELU, LLM_FFN_PAR, model.layers[il].gpu_offload_ratio, cbs,il);
-                } else {
-                    // fallback to dense
-                    cb(cur, "ffn_norm", il);
-                    cur = llm_build_ffn(ctx0, cur,
+                    cur = llm_build_ffn_sparse(ctx0, cur,
                         model.layers[il].ffn_up,   NULL,
                         model.layers[il].ffn_gate, NULL,
                         model.layers[il].ffn_down_t, NULL,
-                        LLM_FFN_RELU, LLM_FFN_PAR, cb, il);
+                        model.layers[il].mlp_pre_w1,
+                        model.layers[il].mlp_pre_w2,
+                        ffn_inp, // as for now, llama's pred use the same input as the ffn
+                        model.layers[il].gpu_idx, 
+                        model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,
+                        LLM_FFN_RELU, gate_type, model.layers[il].gpu_offload_ratio, cbs);
+                } else {
+                    // fallback to dense
+                    cb(cur, "ffn_norm", il);
+                    llm_ffn_op_type   act_type = model.arch == LLM_ARCH_BAMBOO ? LLM_FFN_RELU : LLM_FFN_SILU;
+                    cur = llm_build_ffn(ctx0, cur,
+                        model.layers[il].ffn_up,   NULL,
+                        model.layers[il].ffn_gate, NULL,
+                        model.layers[il].ffn_down, NULL,
+                        act_type, gate_type, cb, il);
                 }
             }
 
@@ -5929,8 +5123,7 @@ struct llm_build_context {
                 cur = llm_build_ffn_sparse(ctx0, attn_norm,
                     model.layers[il].ffn_up,   NULL,
                     NULL, NULL,
-                    model.layers[il].ffn_down, NULL,
-                    model.layers[il].ffn_down_t,
+                    model.layers[il].ffn_down_t, NULL,
                     model.layers[il].mlp_pre_w1,
                     model.layers[il].mlp_pre_w2,
                     inpL, // Falcon uses the layer's input as the pred input
@@ -7184,12 +6377,12 @@ static struct ggml_cgraph * llama_build_graph(
     struct llm_build_context llm(lctx, batch, cb, worst_case);
 
     llm.init();
-    // sleep(10);
-    // printf("%s: %d\n", __func__, model.arch);
+
     switch (model.arch) {
         case LLM_ARCH_LLAMA:
+        case LLM_ARCH_BAMBOO:
             {
-                result = llm.build_llama();
+                result = llm.build_llama_variants();
             } break;
         case LLM_ARCH_BAICHUAN:
             {
@@ -7345,7 +6538,7 @@ static int llama_decode_internal(
     //printf("kv_self.n = %d\n", kv_self.n);
 
     ggml_allocr_reset(lctx.alloc);
-    // printf("llama_build_graph(lctx, batch)\n");
+
     ggml_cgraph * gf = llama_build_graph(lctx, batch);
 
     ggml_allocr_alloc_graph(lctx.alloc, gf);
@@ -7399,7 +6592,8 @@ static int llama_decode_internal(
         model.arch == LLM_ARCH_REFACT     ||
         model.arch == LLM_ARCH_MPT        ||
         model.arch == LLM_ARCH_STARCODER  ||
-        model.arch == LLM_ARCH_STABLELM;
+        model.arch == LLM_ARCH_STABLELM   ||
+        model.arch == LLM_ARCH_BAMBOO;
 
     // const bool fully_offloaded = model.n_gpu_layers >= (int) hparams.n_layer + 3;
     // if (ggml_cpu_has_cublas() && full_offload_supported && fully_offloaded) {

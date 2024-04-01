@@ -143,6 +143,8 @@ We recommend using [`huggingface-cli`](https://huggingface.co/docs/huggingface_h
 
 ```shell
 huggingface-cli download --resume-download --local-dir ReluLLaMA-7B --local-dir-use-symlinks False PowerInfer/ReluLLaMA-7B-PowerInfer-GGUF
+huggingface-cli download --resume-download --local-dir ReluLLaMA-13B --local-dir-use-symlinks False PowerInfer/ReluLLaMA-13B-PowerInfer-GGUF
+huggingface-cli download --resume-download --local-dir Falcon-40B --local-dir-use-symlinks False PowerInfer/ReluFalcon-40B-PowerInfer-GGUF
 ```
 
 As such, PowerInfer can automatically make use of the following directory structure for feature-complete model offloading:
