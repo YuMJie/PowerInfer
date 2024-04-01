@@ -182,6 +182,16 @@ For the same reason, we suggest keeping the same directory structure as PowerInf
 
 ## Inference
 
+### server
+```
+./build/bin/main_server -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time" 
+```
+
+### client
+```
+./build/bin/main_client -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time"  --seed 0 --temp 0 
+```
+
 For CPU-only and CPU-GPU hybrid inference with all available VRAM, you can use the following instructions to run PowerInfer:
 ```bash
 ./build/bin/main -m /PATH/TO/MODEL -n $output_token_count -t $thread_num -p $prompt
@@ -189,7 +199,6 @@ For CPU-only and CPU-GPU hybrid inference with all available VRAM, you can use t
 # For Windows: .\build\bin\Release\main.exe -m .\ReluFalcon-40B-PowerInfer-GGUF\falcon-40b-relu.q4.powerinfer.gguf -n 128 -t 8 -p "Once upon a time"
 ```
 
- ./build/bin/main -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --vram-budget 8
 
 If you want to limit the VRAM usage of GPU:
 ```bash
