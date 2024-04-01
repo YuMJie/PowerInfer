@@ -1,4 +1,5 @@
 *.o
+*.pt
 *.a
 *.so
 *.gguf
@@ -100,3 +101,11 @@ tests/test-tokenizer-1-llama
 tests/test-tokenizer-1-bpe
 
 build-info.h
+ReluLLaMA-13B/.gitattributes
+ReluLLaMA-13B/.gitignore
+ReluLLaMA-13B/config.json
+ReluLLaMA-13B/README.md
+Falcon-40B/.gitattributes
+Falcon-40B/.gitignore
+Falcon-40B/config.json
+Falcon-40B/README.md

@@ -651,10 +651,17 @@ static int send_server_metadata_to_client_LLM_vec_withvector_api_only_read(std::
 	/* We need to setup requested memory buffer. This is where the client will 
 	* do RDMA READs and WRITEs. */
 //dma_buffer_alloc() 函数为服务器端分配内存缓冲区，并设置访问权限。
+
+
 		size_t size =  tensor_dsts.size();
 		server_buffer_mrs.resize(size);
 		for(int i=0;i<size;++i)
-		{
+		{       printf("%s i=%d\n",__func__,i);
+
+                void *data = malloc(ggml_nbytes(tensor_dsts[i]));
+                data = memcpy(data,tensor_dsts[i]->data,ggml_nbytes(tensor_dsts[i]));
+               tensor_dsts[i]->data = data;
+                
 			   server_buffer_mrs[i] = rdma_buffer_register(pd /* which protection domain */, 
 		       tensor_dsts[i]->data,
 			   ggml_nbytes(tensor_dsts[i]) /* what size to allocate */, 
@@ -2912,7 +2919,6 @@ struct llama_model_loader {
                 size_pref += ggml_nbytes(cur);
             }
 
-            // tensor_dsts.push_back(cur);
         }
 
         if (use_mmap) {
@@ -2940,21 +2946,24 @@ struct llama_model_loader {
                 cur->data = (uint8_t*)malloc(ggml_nbytes(cur));
                 #endif
             }
+
+            tensor_dsts.push_back(cur);
+
+        }
             // std::free(cur->data);
             // printf("free_data\n");
-
+        clock_t start = clock();
+        for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
+            struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
             load_data_for(cur); //给data赋值
-            // if(i)
-            // {   
-                printf("cur->name:%s\n",cur->name);
-                printf(cur->name);
-                printf_dim(cur);
-                tensor_dsts.push_back(cur);
-                printf_value(cur);
 
-            // }
+            if(cur->data==NULL)
+            {
+                printf("cur->data is NULL\n");
+            }
+
         }
-
+        std::cout << "花费了" << (double)(clock() - start) / CLOCKS_PER_SEC << "秒" << std::endl;
         send_server_metadata_to_client_LLM_vec_withvector_api_only_read(tensor_dsts);
         sleep(1000);
         // disconnect_and_cleanup_LLM_vec();
@@ -5544,58 +5553,10 @@ static struct ggml_tensor * llm_build_ffn_sparse_rdma(
     cb(idx, "mlp_pre_hidden");
     idx = ggml_relu(ctx, idx);
     cb(idx, "mlp_pre_relu");
-    idx = ggml_mul_mat_pre_w2(ctx, pre_w2, idx,up,gpu_bucket,up_gpu,il,layer);
+    idx = ggml_mul_mat(ctx, pre_w2, idx);
     (full_gpu ? cb : cb_outer)(idx, "mlp_pre_out");
 
-    ggml_tensor *idx_threshold = ggml_threshold(ctx, idx);
-    cb(idx_threshold, "idx_threshold");
-    // printf("idx: %d\n", idx->backend);
-    // printf_dim(up_gpu, "up_gpu");
-    // printf("il: %d\n",il);
-    struct ggml_tensor * tensor = ((struct ggml_tensor **) rdma_idx_vec)[il];
-    // cb(rdma_idx, "rdma_idx");
-    if(idx->ne[1]==tensor->ne[1])
-    {
-        // ggml_add(ctx,idx,tensor);
-    }
-    // printf_dim(rdma_idx);
-    // printf_dim(idx);
-    // if(idx->ne[1]==rdma_idx->ne[1])
-    // {
-    // struct ggml_tensor * rdma_idx = ggml_add_rdma(ctx,idx,rdma_idx_vec,il);
-    //     cb(rdma_idx, "rdma_idx");
-    // }
-    // printf("start\n");
-    up_gpu = ggml_assign(ctx, up_gpu, up_gpu,idx_threshold,up,up_gpu,il,layer);//#TODO 交换顺序并将rdma_idx输入，保持图的完整性
-    // printf("up_gpu: %d\n", up_gpu->backend);//CPU
-    // ggml_cuda_assign_buffers_no_alloc(up_gpu);
-    (full_gpu ? cb : cb_outer)(up_gpu, "up_gpu_rdma");
-    // printf("end\n");
-    // up_gpu->extra = layer->ffn_up_gpu->extra;
-    // if(il == 0)
-    // {
-    // printf_dim(pred_inpl, "pred_inpl");
-    // printf_dim(pre_w1, "pre_w1");
-    // printf_dim(pre_w2, "pre_w2");
-    // printf_dim(rdma_idx, "rdma_idx");
-    // printf_dim(gpu_index, "gpu_index");
-    // printf_dim(idx, "idx");
-    // }
 
-    // idx = ggml_add(ctx, idx, gpu_index);
-
-    // printf("gpu_index: %s\n", gpu_index->name);
-    // printf_dim(up_gpu, "up_gpu");
-
-    // {
-        // free(up_gpu->data);
-        // printf("create_striped_mat_to_gpu_rdma \n");
-        // struct ggml_tensor * temp = create_striped_mat_to_gpu_rdma(ctx,up, gpu_bucket);//out of memory
-        // printf("create_striped_mat_to_gpu_rdma1\n");
-        // ggml_cuda_free_data(temp);
-        // printf("ggml_cuda_free_data\n");
-    // }
-    // printf_dim(up_gpu, "up_gpu1");
     // FFN up
     struct ggml_tensor * up_out = llm_build_sparse_mul_mat(ctx, up, ffn_input, idx, up_gpu, gpu_index, gpu_bucket, cb_outer, "up", full_gpu);
     if (up_b) {
@@ -5962,8 +5923,8 @@ struct llm_build_context {
                         model.layers[il].ffn_down_t,
                         model.layers[il].mlp_pre_w1,
                         model.layers[il].mlp_pre_w2,
-                        // ffn_inp, // as for now, llama's pred use the same input as the ffn
-                         inpSA, // as for now, llama's pred use the last input as the ffn
+                        ffn_inp, // as for now, llama's pred use the same input as the ffn
+                        //  inpSA, // as for now, llama's pred use the last input as the ffn
                         model.layers[il].gpu_idx, 
                         model.layers[il].gpu_bucket, model.layers[il].ffn_gate_gpu, model.layers[il].ffn_down_gpu, model.layers[il].ffn_up_gpu,layer, 
                         LLM_FFN_RELU, LLM_FFN_PAR, model.layers[il].gpu_offload_ratio, cbs,il);

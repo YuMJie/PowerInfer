@@ -53,9 +53,9 @@ void debug(const char* msg, Args... args) {
 /* Capacity of the completion queue (CQ) */
 #define CQ_CAPACITY (16)
 /* MAX SGE capacity */
-#define MAX_SGE (2)
+#define MAX_SGE (10)
 /* MAX work requests */
-#define MAX_WR (8)
+#define MAX_WR (200)
 /* Default port where the RDMA server is listening */
 #define DEFAULT_RDMA_PORT (20886)
 
@@ -89,12 +89,12 @@ union stag {
 	uint32_t remote_stag;
 };
 struct __attribute((packed)) rdma_buffer_attr_vec {
-  uint64_t address[400];
-  uint32_t length[400];
+  uint64_t address[1000];
+  uint32_t length[1000];
   enum FFN_TYPE type[400];
   uint8_t il[400];
   uint64_t size;
-  stag stags[400];
+  stag stags[1000];
 
 };
 

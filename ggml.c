@@ -9951,7 +9951,7 @@ static void ggml_compute_forward_mul_mat(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
               struct ggml_tensor * dst) {
-    printf("ggml_compute_forward_mul_mat\n");
+    // printf("ggml_compute_forward_mul_mat\n");
     int64_t t0 = ggml_perf_time_us();
     UNUSED(t0);
 
