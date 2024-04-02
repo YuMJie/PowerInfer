@@ -104,7 +104,8 @@ void func_get_ctx(){
 }
 
 
-sockaddr_in  get_server_sockaddr(char *ip, char * port) {
+sockaddr_in  get_server_sockaddr(char *ip, char * port) 
+{
 	struct sockaddr_in server_sockaddr;
 	int ret, option;
 	bzero(&server_sockaddr, sizeof server_sockaddr);
@@ -125,7 +126,6 @@ sockaddr_in  get_server_sockaddr(char *ip, char * port) {
 	}
 	return server_sockaddr;
 }
-
 static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 {	
 	struct rdma_cm_event *cm_event = NULL;
@@ -265,7 +265,6 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	debug("QP created at %p \n", client_qp);
 	return 0;
 }
-
 static int client_connect_to_server() 
 {
 	struct rdma_conn_param conn_param;
@@ -298,147 +297,13 @@ static int client_connect_to_server()
 	printf("The client is connected successfully \n");
 	return 0;
 }
-
-
-
-//准备服务器元数据缓冲区
-static int client_pre_post_recv_buffer_LLM_vec_api(rdma_buffer_attr_vec & server_metadata_attrs)
-{
-	int ret = -1;
-
-	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
-			&server_metadata_attrs,
-			sizeof(server_metadata_attrs),
-			(IBV_ACCESS_LOCAL_WRITE));
-	if(!server_metadata_mr){
-		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
-		return -ENOMEM;
-	}
-	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
-	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
-	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
-	/* now we link it to the request */
-	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	server_recv_wr.sg_list = &server_recv_sge;
-	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr /* receive work request*/,
-		      &bad_server_recv_wr /* error WRs */);
-	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
-	}
-	debug("Receive buffer pre-posting is successful \n");
-	return 0;
-}
-static int client_pre_post_recv_buffer_LLM_vec_api_only_read(rdma_buffer_attr_vec & server_metadata_attrs)
-{
-	int ret = -1;
-
-	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
-			&server_metadata_attrs,
-			sizeof(server_metadata_attrs),
-			(IBV_ACCESS_LOCAL_WRITE));
-	if(!server_metadata_mr){
-		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
-		return -ENOMEM;
-	}
-	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
-	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
-	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
-	/* now we link it to the request */
-	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	server_recv_wr.sg_list = &server_recv_sge;
-	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr /* receive work request*/,
-		      &bad_server_recv_wr /* error WRs */);
-	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
-	}
-	debug("Receive buffer pre-posting is successful \n");
-	return 0;
-}
-
-//tensors_src的信息注册到client_src_mrs中，然后向服务器发送client_src_mrs的元信息
-std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api(std::vector<ggml_tensor *> &tensor_src,rdma_buffer_attr_vec & server_metadata_attrs )
+std::vector<ibv_mr *>  client_register_mrs(std::vector<ggml_tensor *> &tensor_src)
 {	
 	std::vector<ibv_mr *> client_src_mrs(tensor_src.size());
 	struct ibv_wc wc[2];
 	int ret = -1;
 	for(int i=0;i<tensor_src.size();++i){
-	client_src_mrs[i] = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个名为client_src_mr的内存区域。这个内存区域包含了客户端要发送给服务器的数据。注册内存区域时，指定了访问权限，包括本地写入、远程读取和远程写入
-			tensor_src[i]->data,
-			ggml_nbytes(tensor_src[i]),
-			(ibv_access_flags)(IBV_ACCESS_LOCAL_WRITE|
-			 IBV_ACCESS_REMOTE_READ|
-			 IBV_ACCESS_REMOTE_WRITE));
-			 
-	if(!client_src_mrs[i]){
-		rdma_error("Failed to register the first buffer, ret = %d \n", ret);
-		exit(1);
-	}
-	/* we prepare metadata for the first buffer */ //
-	client_metadata_attrs.address[i] = (uint64_t) client_src_mrs[i]->addr; 
-	client_metadata_attrs.length[i] = client_src_mrs[i]->length; 
-	client_metadata_attrs.stags[i].local_stag = client_src_mrs[i]->lkey;
-
-	}
-	client_metadata_attrs.size = tensor_src.size();
-	// client_metadata_attr.stag.il = 0; 
-	/* now we register the metadata memory */
-	client_metadata_mr = rdma_buffer_register(pd, //接下来，代码准备了第一个缓冲区的元数据。元数据包括缓冲区的地址、长度和本地标签。然后，代码调用rdma_buffer_register函数来注册一个名为client_metadata_mr的内存区域，用于存储元数据。同样地，注册内存区域时指定了访问权限。
-			&client_metadata_attrs,
-			sizeof(client_metadata_attrs),
-			IBV_ACCESS_LOCAL_WRITE);
-
-
-	if(!client_metadata_mr) {
-		rdma_error("Failed to register the client metadata buffer, ret = %d \n", ret);
-		exit(1);
-	}
-	/* now we fill up SGE */ //然后，代码填充了一个名为client_send_sge的Scatter-Gather元素，用于指定发送工作请求的缓冲区地址、长度和本地键。接着，代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	client_send_sge.addr = (uint64_t) client_metadata_mr->addr;
-	client_send_sge.length = (uint32_t) client_metadata_mr->length;
-	client_send_sge.lkey = client_metadata_mr->lkey;
-	/* now we link to the send work request */
-	bzero(&client_send_wr, sizeof(client_send_wr)); //代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	client_send_wr.sg_list = &client_send_sge;
-	client_send_wr.num_sge = 1;
-	client_send_wr.opcode = IBV_WR_SEND;
-	client_send_wr.send_flags = IBV_SEND_SIGNALED;
-	/* Now we post it */
-	ret = ibv_post_send(client_qp,  //调用ibv_post_send函数将发送工作请求提交到客户端的队列中。
-		       &client_send_wr,
-	       &bad_client_send_wr);
-	if (ret) {
-		rdma_error("Failed to send client metadata, errno: %d \n", 
-				-errno);
-		exit(1);
-	}
-	/* at this point we are expecting 2 work completion. One for our 
-	 * send and one for recv that we will get from the server for 
-	 * its buffer information */
-	
-	ret = process_work_completion_events(io_completion_channel, //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
-			wc, 2);
-	if(ret != 2) {
-		rdma_error("We failed to get 2 work completions , ret = %d \n",
-				ret);
-		exit(1);
-	}
-	debug("Server sent us its buffer location and credentials, showing \n");
-	show_rdma_buffer_attrs(&server_metadata_attrs);
-	return client_src_mrs;
-}
-std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api_only_read(std::vector<ggml_tensor *> &tensor_src,rdma_buffer_attr_vec & server_metadata_attrs )
-{	
-	std::vector<ibv_mr *> client_src_mrs(tensor_src.size());
-	struct ibv_wc wc[2];
-	int ret = -1;
-	for(int i=0;i<tensor_src.size();++i){
-		        if(tensor_src[i]->data==NULL)
+		if(tensor_src[i]->data==NULL)
         {
             printf("tensor_src[%d]->data==NULL\n",i);
         }
@@ -458,49 +323,20 @@ std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api_only_read
 		rdma_error("Failed to register the first buffer, ret = %d \n", ret);
 		exit(1);
 	}
-	/* we prepare metadata for the first buffer */ //
-	// client_metadata_attrs.address[i] = (uint64_t) client_src_mrs[i]->addr; 
-	// client_metadata_attrs.length[i] = client_src_mrs[i]->length; 
-	// client_metadata_attrs.stags[i].local_stag = client_src_mrs[i]->lkey;
 
 	}
-	// client_metadata_attrs.size = tensor_src.size();
-	// client_metadata_attr.stag.il = 0; 
-	/* now we register the metadata memory */
-	// client_metadata_mr = rdma_buffer_register(pd, //接下来，代码准备了第一个缓冲区的元数据。元数据包括缓冲区的地址、长度和本地标签。然后，代码调用rdma_buffer_register函数来注册一个名为client_metadata_mr的内存区域，用于存储元数据。同样地，注册内存区域时指定了访问权限。
-	// 		&client_metadata_attrs,
-	// 		sizeof(client_metadata_attrs),
-	// 		IBV_ACCESS_LOCAL_WRITE);
 
 
-	// if(!client_metadata_mr) {
-	// 	rdma_error("Failed to register the client metadata buffer, ret = %d \n", ret);
-	// 	exit(1);
-	// }
-	/* now we fill up SGE */ //然后，代码填充了一个名为client_send_sge的Scatter-Gather元素，用于指定发送工作请求的缓冲区地址、长度和本地键。接着，代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	// client_send_sge.addr = (uint64_t) client_metadata_mr->addr;
-	// client_send_sge.length = (uint32_t) client_metadata_mr->length;
-	// client_send_sge.lkey = client_metadata_mr->lkey;
-	/* now we link to the send work request */
-	// bzero(&client_send_wr, sizeof(client_send_wr)); //代码初始化了一个名为client_send_wr的发送工作请求结构，并将client_send_sge添加到其中。还设置了工作请求的操作码为IBV_WR_SEND，表示发送数据。
-	// client_send_wr.sg_list = &client_send_sge;
-	// client_send_wr.num_sge = 1;
-	// client_send_wr.opcode = IBV_WR_SEND;
-	// client_send_wr.send_flags = IBV_SEND_SIGNALED;
-	// /* Now we post it */
-	// ret = ibv_post_send(client_qp,  //调用ibv_post_send函数将发送工作请求提交到客户端的队列中。
-	// 	       &client_send_wr,
-	//        &bad_client_send_wr);
-	// if (ret) {
-	// 	rdma_error("Failed to send client metadata, errno: %d \n", 
-	// 			-errno);
-	// 	exit(1);
-	// }
-	/* at this point we are expecting 2 work completion. One for our 
-	 * send and one for recv that we will get from the server for 
-	 * its buffer information */
-	
-	ret = process_work_completion_events(io_completion_channel, //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
+	return client_src_mrs;
+}
+//通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
+static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs,ibv_wr_opcode opcode) 
+{	
+	int size =client_dst_mrs.size();
+
+    int ret = -1;
+    struct ibv_wc wc[size];
+    ret = process_work_completion_events(io_completion_channel, //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
 			wc, 1);
 
 	if(ret != 1) {
@@ -508,106 +344,8 @@ std::vector<ibv_mr *>  client_xchange_metadata_with_server_LLM_vec_api_only_read
 				ret);
 		exit(1);
 	}
-	debug("Server sent us its buffer location and credentials, showing \n");
+    debug("Server sent us its buffer location and credentials, showing \n");
 	show_rdma_buffer_attrs(&server_metadata_attrs);
-	return client_src_mrs;
-}
-
-//根据client_src_mrs和server_metadata_attrs的信息，向服务器写请求
-static int client_remote_memory_ops_LLM_vec_write_api(std::vector<ibv_mr *> client_src_mrs,rdma_buffer_attr_vec & server_metadata_attrs) 
-{	
-	int size =client_src_mrs.size();
-	struct ibv_wc wc[size];
-	int ret = -1;
-
-	/* Step 1: is to copy the local buffer into the remote buffer. We will 
-	 * reuse the previous variables. */
-	/* now we fill up SGE */ 
-	//将本地缓冲区的地址、长度和本地键（lkey）赋值给client_send_sge结构体，表示发送的数据。
-	
-	
-	for(int i=0;i<size;++i)
-	{	
-
-		client_send_sge.addr = (uint64_t) client_src_mrs[i]->addr;
-		client_send_sge.length = (uint32_t) client_src_mrs[i]->length;
-		client_send_sge.lkey = client_src_mrs[i]->lkey;
-		bzero(&client_send_wr, sizeof(client_send_wr));
-		client_send_wr.sg_list = &client_send_sge;
-		client_send_wr.num_sge = 1;
-		client_send_wr.opcode = IBV_WR_RDMA_WRITE;
-		client_send_wr.send_flags = IBV_SEND_SIGNALED;
-		/* we have to tell server side info for RDMA */ //设置远程RDMA操作的相关信息，包括远程键（rkey）和远程地址。
-		client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
-		client_send_wr.wr.rdma.remote_addr = server_metadata_attrs.address[i];
-		/* Now we post it */
-		ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
-				&client_send_wr,
-			&(bad_client_send_wr));
-		if (ret) {
-		printf("Failed to write client src buffer, errno: %d %s\n", 
-				-errno, strerror(errno));
-		return -errno;
-		}
-		if((i+1)%5==0)
-		{
-			ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
-			wc, 5);
-			if(ret != 5) {
-				rdma_error("We failed to get 2 work completions , ret = %d \n",
-						ret);
-			return ret;
-			}
-		}
-	}
-		ret = process_work_completion_events(io_completion_channel,  //函数等待并处理工作完成事件。
-		wc, size%5);
-		if(ret != size%5) {
-			rdma_error("We failed to get 2 work completions , ret = %d \n",
-					ret);
-		return ret;
-		}
-	/* now we link to the send work request */ //初始化client_send_wr结构体，并设置相关参数，如SGE列表、SGE数量、操作码（IBV_WR_RDMA_WRITE）和发送标志（IBV_SEND_SIGNALED）。
-
-	// ret = ibv_post_send(client_qp,  //调用ibv_post_send()函数将发送请求发送到RDMA队列中。
-	// 		&client_send_wr,
-	// 	&bad_client_send_wr);
-
-	/* at this point we are expecting 1 work completion for the write */
-
-	debug("Client side WRITE is complete \n");
-
-	return 0;
-}
-
-//把tensor_dst的信息注册到client_dst_mrs中
-std::vector<ibv_mr *> client_remote_memory_ops_LLM_vec_register_read_api(std::vector<ggml_tensor *> &tensor_dst) 
-{
-	struct ibv_wc wc[tensor_dst.size()];
-	int ret = -1;
-	std::vector<ibv_mr *> client_dst_mrs(tensor_dst.size());
-	for(int i=0;i<tensor_dst.size();++i)
-	{		
-		client_dst_mrs[i] = rdma_buffer_register(pd, //使用rdma_buffer_register()函数将dst缓冲区注册到RDMA设备上，并指定访问权限为本地写、远程写和远程读。
-		tensor_dst[i]->data,
-		ggml_nbytes(tensor_dst[i]),
-		(ibv_access_flags )(IBV_ACCESS_LOCAL_WRITE | 
-			IBV_ACCESS_REMOTE_WRITE | 
-			IBV_ACCESS_REMOTE_READ));
-		if (!client_dst_mrs[i]) {
-			rdma_error("We failed to create the destination buffer, -ENOMEM\n");
-			exit(1);
-		}
-	}
-	return client_dst_mrs;
-}
-
-//通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
-static int client_remote_memory_ops_LLM_vec_read_api(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs) 
-{	
-	int size =client_dst_mrs.size();
-	struct ibv_wc wc[size];
-	int ret = -1;
 	/* Step 1: is to copy the local buffer into the remote buffer. We will 
 	 * reuse the previous variables. */
 	/* now we fill up SGE */ 
@@ -623,7 +361,7 @@ static int client_remote_memory_ops_LLM_vec_read_api(std::vector<ibv_mr *> clien
 		bzero(&client_send_wr, sizeof(client_send_wr));
 		client_send_wr.sg_list = &client_send_sge;
 		client_send_wr.num_sge = 1;
-		client_send_wr.opcode = IBV_WR_RDMA_READ;
+		client_send_wr.opcode = opcode;
 		client_send_wr.send_flags = IBV_SEND_SIGNALED;
 		/* we have to tell server side info for RDMA */ // 设置远程RDMA操作的相关信息，包括远程键和远程地址。
 		client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
@@ -659,6 +397,37 @@ static int client_remote_memory_ops_LLM_vec_read_api(std::vector<ibv_mr *> clien
 	debug("Client side READ is complete \n");
 	return 0;
 }
+static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs)
+{
+	int ret = -1;
+
+	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
+			&server_metadata_attrs,
+			sizeof(server_metadata_attrs),
+			(IBV_ACCESS_LOCAL_WRITE));
+	if(!server_metadata_mr){
+		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
+		return -ENOMEM;
+	}
+	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
+	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
+	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
+	/* now we link it to the request */
+	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
+	server_recv_wr.sg_list = &server_recv_sge;
+	server_recv_wr.num_sge = 1;
+	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
+		      &server_recv_wr /* receive work request*/,
+		      &bad_server_recv_wr /* error WRs */);
+	if (ret) {
+		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
+		return ret;
+	}
+	debug("Receive buffer pre-posting is successful \n");
+	return 0;
+}
+
+
 static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client_dst_mrs,std::vector<ibv_mr *> &client_src_mrs) 
 {	
 	size_t size =client_dst_mrs.size();
@@ -731,7 +500,6 @@ static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client
 	printf("Client resource clean up is complete \n");
 	return 0;
 }
-
 
 
 
@@ -823,7 +591,7 @@ int main(int argc, char **argv) {
 
 	client_prepare_connection_api(&server_sockaddr);
 	printf("start client_pre_post_recv_buffer_LLM_vec_api\n");
-	ret = client_pre_post_recv_buffer_LLM_vec_api_only_read(server_metadata_attrs); 
+	ret = client_recv_buffer(server_metadata_attrs); 
 	if (ret) { 
 		rdma_error("Failed to setup client connection , ret = %d \n", ret);
 		return ret;
@@ -837,14 +605,14 @@ int main(int argc, char **argv) {
 	}
 		printf("start client_xchange_metadata_with_server_LLM_vec_api\n");
 
-	client_src_mrs= client_xchange_metadata_with_server_LLM_vec_api_only_read(tensor_dsts,server_metadata_attrs);
+	client_src_mrs= client_register_mrs(tensor_dsts);
 	printf("start client_remote_memory_ops_LLM_vec_write_api\n");
 
 	// client_remote_memory_ops_LLM_vec_write_api(client_src_mrs);
 	// printf("start client_remote_memory_ops_LLM_vec_register_read_api\n");
 
 	// client_dst_mrs=client_remote_memory_ops_LLM_vec_register_read_api(tensor_dsts);
-	ret = client_remote_memory_ops_LLM_vec_read_api(client_src_mrs,server_metadata_attrs);
+	ret = client_operation(client_src_mrs,server_metadata_attrs,IBV_WR_RDMA_READ);
 
 
 	if (ret) {
