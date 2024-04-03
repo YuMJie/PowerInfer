@@ -28,9 +28,16 @@
 #include <infiniband/verbs.h>
 #include <vector>
 /* Error Macro*/
-#define rdma_error(msg, args...) do {\
-    std::cerr << __FILE__ << " : " << __LINE__ << " : ERROR : " << msg << std::endl; \
-}while(0);
+#define rdma_error(msg, args...) \
+		do {\
+            fprintf(stderr, "RDMA_ERROR: %s:%d:\n", __FILE__, __LINE__); \
+            fflush(stderr); \
+            fflush(stdout); \
+			fprintf(stderr, msg, ## args); \
+            exit(1); \
+			} \
+		while(0);
+
 
 // #ifdef ACN_RDMA_DEBUG 
 // /* Debug Macro */
