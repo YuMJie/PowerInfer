@@ -42,7 +42,9 @@ void show_rdma_buffer_attrs(struct rdma_buffer_attr_vec *attr){
 		rdma_error("Passed attr is NULL\n");
 		return;
 	}
+	printf("attr->size: %u\n", attr->size);
 	for(int i = 0; i < attr->size; i++){
+		printf("i: %d\n", i);
 		printf("---------------------------------------------------------\n");
 		printf("buffer attr, addr: %p , len: %u , stag : 0x%x \n", 
 				(void*) attr->address[i], 
@@ -50,7 +52,7 @@ void show_rdma_buffer_attrs(struct rdma_buffer_attr_vec *attr){
 				attr->stags[i].local_stag);
 		printf("---------------------------------------------------------\n");
 	}
-
+	printf("end of buffer attr\n");
 }
 
 struct ibv_mr* rdma_buffer_alloc(struct ibv_pd *pd, uint32_t size,
@@ -195,6 +197,7 @@ int process_work_completion_events (struct ibv_comp_channel *comp_channel,
        debug("%d WC are completed \n", total_wc);
        /* Now we check validity and status of I/O work completions */
        for( i = 0 ; i < total_wc ; i++) {
+			printf("wc[i].opcode: %d\n", wc[i].opcode);
 	       if (wc[i].status != IBV_WC_SUCCESS) {
 		       printf("Work completion (WC) has error status: %s at index %d", 
 				       ibv_wc_status_str(wc[i].status), i);

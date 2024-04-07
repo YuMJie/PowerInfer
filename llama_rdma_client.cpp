@@ -13,7 +13,7 @@
 #elif defined(GGML_USE_CLBLAST)
 #  include "ggml-opencl.h"
 #endif
-
+// #include "rdma_common.h"
 #ifdef GGML_USE_METAL
 #  include "ggml-metal.h"
 #endif
@@ -54,6 +54,7 @@
     #include <libgen.h>
 #endif
 
+#include <iostream>
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -84,7 +85,6 @@
 #include <vector>
 #include <ctime>
 
-#include "rdma_common.h"
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -123,6 +123,8 @@ static void llama_log_callback_default(ggml_log_level level, const char * text, 
 //
 
 //=============rdma=====================
+#define NUM_QPS 5
+
 static struct rdma_event_channel *cm_event_channel = NULL;
 static struct rdma_cm_id *cm_client_id = NULL;
 static struct ibv_pd *pd = NULL;
@@ -138,37 +140,17 @@ static struct rdma_buffer_attr client_metadata_attr, server_metadata_attr;
 static struct ibv_send_wr client_send_wr, *bad_client_send_wr = NULL;
 static struct ibv_recv_wr server_recv_wr, *bad_server_recv_wr = NULL;
 static struct ibv_sge client_send_sge, server_recv_sge;
-void printf_dim(ggml_tensor * t ,char * str ="") {
-    printf("%s:%s %s: %d %d %d %d\n", __func__, t->name, str,t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-}
-void printf_value(struct ggml_tensor * tensor,int num =10)
-{
-    int ne0=tensor->ne[0];
-    int ne1=tensor->ne[1];
-    int ne2=tensor->ne[2];
-    int ne3=tensor->ne[3];
-    for(int i=0;i<ne3;i++)
-    {
-        for(int j=0;j<ne2;j++)
-        {
-            for(int k=0;k<ne1;k++)
-            {
-                for(int l=0;l<ne0;l++)
-                {   
-                    if(--num)
-                    {
-                        printf("%f ",ggml_get_f32_nd(tensor,l,k,j,i));
-                    }
-                    else
-                    {
-                        return;
-                    }
-                }
-            }
+static struct rdma_cm_id *cm_client_ids[NUM_QPS];
+static struct ibv_comp_channel *io_completion_channels[NUM_QPS];
+static struct ibv_cq *client_cqs[NUM_QPS];
+static struct ibv_qp *client_qps[NUM_QPS];
+static struct ibv_qp_init_attr qp_init_attrs[NUM_QPS];
+std::vector<struct ibv_mr *> client_buffer_mrs;
+static struct rdma_buffer_attr_vec client_metadata_attrs;
 
-        }
-    }
-}
+// extern struct ggml_tensor * prompt_sparse_tensor[400];
+ //TODO
+
 sockaddr_in  get_server_sockaddr(char *ip, char * port) 
 {
 	struct sockaddr_in server_sockaddr;
@@ -192,6 +174,9 @@ sockaddr_in  get_server_sockaddr(char *ip, char * port)
 	return server_sockaddr;
 }
 
+void printf_dim(ggml_tensor * t ,char * str ="") {
+    printf("%s:%s %s: %d %d %d %d\n", __func__, t->name, str,t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
 static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 {	
 	struct rdma_cm_event *cm_event = NULL;
@@ -206,7 +191,9 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	/* rdma_cm_id is the connection identifier (like socket) which is used 
 	 * to define an RDMA connection. 
 	 */
-	ret = rdma_create_id(cm_event_channel, &cm_client_id,  //函数创建一个RDMA连接标识符
+	for(int i=0;i<NUM_QPS;++i)
+	{
+	ret = rdma_create_id(cm_event_channel, &cm_client_ids[i],  //函数创建一个RDMA连接标识符
 			NULL,
 			RDMA_PS_TCP);
 	if (ret) {
@@ -216,7 +203,7 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	/* Resolve destination and optional source addresses from IP addresses  to
 	 * an RDMA address.  If successful, the specified rdma_cm_id will be bound
 	 * to a local device. */
-	ret = rdma_resolve_addr(cm_client_id, NULL, (struct sockaddr*) s_addr, 2000); //函数将目标地址解析为RDMA地址，并将cm_client_id与本地设备绑定。
+	ret = rdma_resolve_addr(cm_client_ids[i], NULL, (struct sockaddr*) s_addr, 2000); //函数将目标地址解析为RDMA地址，并将cm_client_id与本地设备绑定。
 	if (ret) {
 		rdma_error("Failed to resolve address, errno: %d \n", -errno);
 		exit(1);
@@ -239,7 +226,7 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 
 	 /* Resolves an RDMA route to the destination address in order to 
 	  * establish a connection */
-	ret = rdma_resolve_route(cm_client_id, 2000); //函数解析到目标地址的RDMA路由，以建立连接
+	ret = rdma_resolve_route(cm_client_ids[i], 2000); //函数解析到目标地址的RDMA路由，以建立连接
 	if (ret) {
 		rdma_error("Failed to resolve route, erno: %d \n", -errno);
 	      exit(1);
@@ -265,7 +252,7 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	 * in the operating system. All resources are tied to a particular PD. 
 	 * And accessing recourses across PD will result in a protection fault.
 	 */
-	pd = ibv_alloc_pd(cm_client_id->verbs);//函数分配一个保护域（Protection Domain），类似于操作系统中的"进程抽象"，所有资源都与特定的保护域相关联
+	if(!i) pd = ibv_alloc_pd(cm_client_ids[0]->verbs);//函数分配一个保护域（Protection Domain），类似于操作系统中的"进程抽象"，所有资源都与特定的保护域相关联
 	if (!pd) {
 		rdma_error("Failed to alloc pd, errno: %d \n", -errno);
 		exit(1);
@@ -277,60 +264,91 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	 * A completion channel is also tied to an RDMA device, hence we will 
 	 * use cm_client_id->verbs. 
 	 */
-	io_completion_channel = ibv_create_comp_channel(cm_client_id->verbs); //函数创建一个完成通道（Completion Channel），用于发送I/O完成通知
-	if (!io_completion_channel) {
+	io_completion_channels[i] = ibv_create_comp_channel(cm_client_ids[i]->verbs); //函数创建一个完成通道（Completion Channel），用于发送I/O完成通知
+	if (!io_completion_channels[i]) {
 		rdma_error("Failed to create IO completion event channel, errno: %d\n",
 			       -errno);
 	exit(1);
 	}
-	debug("completion event channel created at : %p \n", io_completion_channel);
+	debug("completion event channel created at : %p \n", io_completion_channels[i]);
 	/* Now we create a completion queue (CQ) where actual I/O 
 	 * completion metadata is placed. The metadata is packed into a structure 
 	 * called struct ibv_wc (wc = work completion). ibv_wc has detailed 
 	 * information about the work completion. An I/O request in RDMA world 
 	 * is called "work" ;) 
 	 */
-	client_cq = ibv_create_cq(cm_client_id->verbs /* which device*/,  //ibv_create_cq函数创建一个完成队列（Completion Queue），用于存放实际的I/O完成元数据
+	client_cqs[i] = ibv_create_cq(cm_client_ids[i]->verbs /* which device*/,  //ibv_create_cq函数创建一个完成队列（Completion Queue），用于存放实际的I/O完成元数据
 			CQ_CAPACITY /* maximum capacity*/, 
 			NULL /* user context, not used here */,
-			io_completion_channel /* which IO completion channel */, 
+			io_completion_channels[i] /* which IO completion channel */, 
 			0 /* signaling vector, not used here*/);
-	if (!client_cq) {
+	if (!client_cqs[i]) {
 		rdma_error("Failed to create CQ, errno: %d \n", -errno);
 		exit(1);
 	}
-	debug("CQ created at %p with %d elements \n", client_cq, client_cq->cqe);
-	ret = ibv_req_notify_cq(client_cq, 0); //ibv_req_notify_cq函数请求通知，以便在完成队列中有新的完成操作时得到通知
+	debug("CQ created at %p with %d elements \n", client_cqs[i], client_cqs[i]->cqe);
+	ret = ibv_req_notify_cq(client_cqs[i], 0); //ibv_req_notify_cq函数请求通知，以便在完成队列中有新的完成操作时得到通知
 	if (ret) {
 		rdma_error("Failed to request notifications, errno: %d\n", -errno);
 		exit(1);
 	}
-	static struct ibv_qp_init_attr qp_init_attr;
 
        /* Now the last step, set up the queue pair (send, recv) queues and their capacity.
          * The capacity here is define statically but this can be probed from the 
 	 * device. We just use a small number as defined in rdma_common.h */
-       bzero(&qp_init_attr, sizeof qp_init_attr);
-       qp_init_attr.cap.max_recv_sge = MAX_SGE; /* Maximum SGE per receive posting */
-       qp_init_attr.cap.max_recv_wr = MAX_WR; /* Maximum receive posting capacity */
-       qp_init_attr.cap.max_send_sge = MAX_SGE; /* Maximum SGE per send posting */
-       qp_init_attr.cap.max_send_wr = MAX_WR; /* Maximum send posting capacity */
-       qp_init_attr.qp_type = IBV_QPT_RC; /* QP type, RC = Reliable connection */
+       bzero(&qp_init_attrs[i], sizeof qp_init_attrs[i]);
+       qp_init_attrs[i].cap.max_recv_sge = MAX_SGE; /* Maximum SGE per receive posting */
+       qp_init_attrs[i].cap.max_recv_wr = MAX_WR; /* Maximum receive posting capacity */
+       qp_init_attrs[i].cap.max_send_sge = MAX_SGE; /* Maximum SGE per send posting */
+       qp_init_attrs[i].cap.max_send_wr = MAX_WR; /* Maximum send posting capacity */
+       qp_init_attrs[i].qp_type = IBV_QPT_RC; /* QP type, RC = Reliable connection */
        /* We use same completion queue, but one can use different queues */
-       qp_init_attr.recv_cq = client_cq; /* Where should I notify for receive completion operations */
-       qp_init_attr.send_cq = client_cq; /* Where should I notify for send completion operations */
+       qp_init_attrs[i].recv_cq = client_cqs[i]; /* Where should I notify for receive completion operations */
+       qp_init_attrs[i].send_cq = client_cqs[i]; /* Where should I notify for send completion operations */
        /*Lets create a QP */
-       ret = rdma_create_qp(cm_client_id /* which connection id */,
+       ret = rdma_create_qp(cm_client_ids[i] /* which connection id */,
 		       pd /* which protection domain*/,
-		       &qp_init_attr /* Initial attributes */);
+		       &qp_init_attrs[i] /* Initial attributes */);
 	if (ret) {
 		rdma_error("Failed to create QP, errno: %d \n", -errno);
 	       exit(1);
 	}
-	client_qp = cm_client_id->qp;
-	debug("QP created at %p \n", client_qp);
+	client_qps[i] = cm_client_ids[i]->qp;
+	debug("QP created at %p \n", client_qps[i]);
+	}
 	return 0;
 }
+
+static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs ,int qp_index=0 )
+{
+	int ret = -1;
+
+	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
+			&server_metadata_attrs,
+			sizeof(server_metadata_attrs),
+			(IBV_ACCESS_LOCAL_WRITE));
+	if(!server_metadata_mr){
+		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
+		return -ENOMEM;
+	}
+	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
+	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
+	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
+	/* now we link it to the request */
+	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
+	server_recv_wr.sg_list = &server_recv_sge;
+	server_recv_wr.num_sge = 1;
+	ret = ibv_post_recv(client_qps[qp_index] /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
+		      &server_recv_wr /* receive work request*/,
+		      &bad_server_recv_wr /* error WRs */);
+	if (ret) {
+		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
+		return ret;
+	}
+	debug("Receive buffer pre-posting is successful \n");
+	return 0;
+}
+
 static int client_connect_to_server() 
 {
 	struct rdma_conn_param conn_param;
@@ -340,8 +358,10 @@ static int client_connect_to_server()
 	conn_param.initiator_depth = 15;  //表示连接的发起者（客户端）可以同时发送的最大并发请求数。在这里，我们将其设置为 3，表示客户端可以同时发送最多 3 个请求
 	conn_param.responder_resources = 15; // responder_resources 表示连接的响应者（服务器）可以同时处理的最大并发请求数。同样地，我们将其设置为 3。
 	conn_param.retry_count = 60; // if fail, then how many times to retry
-	debug("cm_client_id %p \n", cm_client_id);
-	ret = rdma_connect(cm_client_id, &conn_param); //使用 rdma_connect() 函数来发起与服务器的连接。该函数接受一个 rdma_cm_id 结构体指针 cm_client_id 和一个 rdma_conn_param 结构体指针 conn_param 作为参数。
+	for(int i=0;i<NUM_QPS;++i)
+	{
+	debug("cm_client_ids[i] %p \n", cm_client_ids[i]);
+	ret = rdma_connect(cm_client_ids[i], &conn_param); //使用 rdma_connect() 函数来发起与服务器的连接。该函数接受一个 rdma_cm_id 结构体指针 cm_client_id 和一个 rdma_conn_param 结构体指针 conn_param 作为参数。
 	if (ret) {
 		rdma_error("Failed to connect to remote host , errno: %d\n", -errno);
 		return -errno;
@@ -361,9 +381,10 @@ static int client_connect_to_server()
 		return -errno;
 	}
 	printf("The client is connected successfully \n");
+	}
 	return 0;
 }
-std::vector<ibv_mr *>  client_register_mrs(std::vector<ggml_tensor *> &tensor_src)
+std::vector<ibv_mr *> register_mrs(std::vector<ggml_tensor *> &tensor_src)
 {	
 	std::vector<ibv_mr *> client_src_mrs(tensor_src.size());
 	struct ibv_wc wc[2];
@@ -395,15 +416,13 @@ std::vector<ibv_mr *>  client_register_mrs(std::vector<ggml_tensor *> &tensor_sr
 
 	return client_src_mrs;
 }
-//通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
-static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs,ibv_wr_opcode opcode) 
-{	
-	int size =client_dst_mrs.size();
-
-    int ret = -1;
-    struct ibv_wc wc[size];
-    ret = process_work_completion_events(io_completion_channel, //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
-			wc, 1);
+void wait_for_server_ready(rdma_buffer_attr_vec & server_metadata_attrs ,int qp_index=0)
+{
+	printf("Waiting for server to be ready \n");
+	struct ibv_wc wc;
+	int ret = -1;
+    ret = process_work_completion_events(io_completion_channels[qp_index], //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
+			&wc, 1);
 
 	if(ret != 1) {
 		rdma_error("We failed to get 2 work completions , ret = %d \n",
@@ -412,14 +431,24 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 	}
     debug("Server sent us its buffer location and credentials, showing \n");
 	show_rdma_buffer_attrs(&server_metadata_attrs);
+}
+
+//通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
+static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs,ibv_wr_opcode opcode,int start,int end,int qp_index=0) 
+{	
+
+	int size =client_dst_mrs.size();
+	struct ibv_wc wc[size];
+	int ret = -1;
+
 	/* Step 1: is to copy the local buffer into the remote buffer. We will 
 	 * reuse the previous variables. */
 	/* now we fill up SGE */ 
 	//将本地缓冲区的地址、长度和本地键（lkey）赋值给client_send_sge结构体，表示发送的数据。
-
+	printf("size=%d\n",size);
 
 	for(int i=0;i<size;++i)
-	{
+	{	printf("i=%d\n",i);
 		client_send_sge.addr = (uint64_t) client_dst_mrs[i]->addr;
 		client_send_sge.length = (uint32_t) client_dst_mrs[i]->length;
 		client_send_sge.lkey = client_dst_mrs[i]->lkey;
@@ -428,12 +457,12 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 		client_send_wr.sg_list = &client_send_sge;
 		client_send_wr.num_sge = 1;
 		client_send_wr.opcode = opcode;
-		client_send_wr.send_flags = IBV_SEND_SIGNALED;
+		client_send_wr.send_flags = opcode ==IBV_WR_RDMA_WRITE_WITH_IMM?0: IBV_SEND_SIGNALED;
 		/* we have to tell server side info for RDMA */ // 设置远程RDMA操作的相关信息，包括远程键和远程地址。
 		client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
 		client_send_wr.wr.rdma.remote_addr = server_metadata_attrs.address[i];
 		/* Now we post it */
-		int ret = ibv_post_send(client_qp,  //函数将发送请求发送到RDMA队列中。
+		int ret = ibv_post_send(client_qps[qp_index],  //函数将发送请求发送到RDMA队列中。
 				&client_send_wr,
 			&bad_client_send_wr);
 		if (ret) {
@@ -441,9 +470,9 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 					-errno);
 			return -errno;
 		}
-		if((i+1)%MAX_WR==0)
+		if(client_send_wr.send_flags&&(i+1)%MAX_WR==0)
 		{
-			ret = process_work_completion_events(io_completion_channel, 
+			ret = process_work_completion_events(io_completion_channels[qp_index], 
 			wc, MAX_WR);
 			if(ret != MAX_WR) {
 				rdma_error("We failed to get 2 work completions , ret = %d \n",
@@ -453,45 +482,260 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 		}
 	/* Now we prepare a READ using same variables but for destination */ //将目标缓冲区的地址、长度和本地键赋值给client_send_sge结构体，表示接收的数据
 	}
-	ret = process_work_completion_events(io_completion_channel, 
-	wc, size%MAX_WR);
-	if(ret != size%MAX_WR) {
-		rdma_error("We failed to get 2 work completions , ret = %d \n",
-				ret);
-		return ret;
+	printf("waiting for work completions \n");
+	if(client_send_wr.send_flags){
+			ret = process_work_completion_events(io_completion_channels[qp_index], 
+		wc, size%MAX_WR);
+		if(ret != size%MAX_WR) {
+			rdma_error("We failed to get %d work completions , ret = %d  %s\n",
+					size%MAX_WR,ret, strerror(errno));
+			return ret;
+		}
 	}
-	debug("Client side READ is complete \n");
+	debug("Client side %d is complete \n",opcode);
 	return 0;
 }
-static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs)
-{
-	int ret = -1;
 
-	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
-			&server_metadata_attrs,
-			sizeof(server_metadata_attrs),
-			(IBV_ACCESS_LOCAL_WRITE));
-	if(!server_metadata_mr){
-		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
-		return -ENOMEM;
-	}
-	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
-	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
-	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
-	/* now we link it to the request */
-	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	server_recv_wr.sg_list = &server_recv_sge;
-	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr /* receive work request*/,
-		      &bad_server_recv_wr /* error WRs */);
+// ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_index=0 )  //该函数用于向连接的客户端发送服务器端缓冲区的元数据。
+// {
+// 	struct ibv_wc wc; //工作完成（work completion）结构体
+// 	int ret = -1;
+// 		size_t size =  tensor_dsts.size();
+// 		std::vector<ibv_mr *>  buffer_mrs;
+//         buffer_mrs.resize(size);
+// 		for(int i=0;i<size;++i)
+// 		{
+// 			   buffer_mrs[i] = rdma_buffer_register(pd /* which protection domain */, 
+// 		       tensor_dsts[i]->data,
+// 			   ggml_nbytes(tensor_dsts[i]) /* what size to allocate */, 
+// 		       (ibv_access_flags)(IBV_ACCESS_LOCAL_WRITE|
+// 		       IBV_ACCESS_REMOTE_READ|
+// 		       IBV_ACCESS_REMOTE_WRITE) /* access permissions */);
+// 			if(!buffer_mrs[i]){
+// 				rdma_error("Server failed to create a buffer \n");
+// 				/* we assume that it is due to out of memory error */
+// 			}
+// 			client_metadata_attrs.address[i] = (uint64_t) buffer_mrs[i]->addr;
+// 			client_metadata_attrs.length[i] = (uint32_t) buffer_mrs[i]->length;
+// 			client_metadata_attrs.stags[i].local_stag = (uint32_t) buffer_mrs[i]->lkey;
+			
+// 		}
+// 			client_metadata_attrs.size = size;
+//        /* This buffer is used to transmit information about the above 
+// 	* buffer to the client. So this contains the metadata about the client 
+// 	* buffer. Hence this is called metadata buffer. Since this is already 
+// 	* on allocated, we just register it. 
+//         * We need to prepare a send I/O operation that will tell the 
+// 	* client the address of the client buffer. 
+// 	*/
+// 	//代码准备一个发送操作，用于告知客户端服务器端缓冲区的地址。代码将服务器端缓冲区的地址、长度和本地标签信息填充到client_metadata_attr 结构体中
+//        ibv_mr * client_metadata_mr = rdma_buffer_register(pd /* which protection domain*/,  //调用 rdma_buffer_register() 函数将其注册到保护域中
+// 		       &client_metadata_attrs /* which memory to register */, 
+// 		       sizeof(client_metadata_attrs) /* what is the size of memory */,
+// 		       IBV_ACCESS_LOCAL_WRITE /* what access permission */);
+//        if(!client_metadata_mr){
+// 	       rdma_error("Server failed to create to hold client metadata \n");
+// 	       /* we assume that this is due to out of memory error */
+//        }
+//        /* We need to transmit this buffer. So we create a send request. 
+// 	* A send request consists of multiple SGE elements. In our case, we only
+// 	* have one 
+// 	*/
+// 		//代码创建一个发送请求，并将 client_metadata_attr 结构体的信息填充到 client_send_sge 结构体中。接着，代码将 client_send_sge 结构体与发送请求关联，并设置发送请求的操作码为 IBV_WR_SEND，表示这是一个发送请求。代码还设置发送请求的标志为 IBV_SEND_SIGNALED，表示希望接收到发送完成的通知。
+// 	//    client_recv_buffer(client_metadata_mr);
+// 	   client_send_sge.addr = (uint64_t) &client_metadata_attrs;
+//        client_send_sge.length = sizeof(client_metadata_attrs);
+//        client_send_sge.lkey = client_metadata_mr->lkey;
+//        /* now we link this sge to the send request */
+//        bzero(&client_send_wr, sizeof(client_send_wr));
+//        client_send_wr.sg_list = &client_send_sge;
+//        client_send_wr.num_sge = 1; // only 1 SGE element in the array 
+//        client_send_wr.opcode = IBV_WR_SEND; // This is a send request 
+//        client_send_wr.send_flags = IBV_SEND_SIGNALED; // We want to get notification 
+//        /* This is a fast data path operation. Posting an I/O request */
+// 	   	// sleep(50);
+// 		ret = ibv_post_send(client_qps[qp_index] /* which QP */,   
+// 		&client_send_wr /* Send request that we prepared before */, 
+// 		&bad_client_send_wr /* In case of error, this will contain failed requests */);
+// 		if (ret) {
+// 			rdma_error("Posting of client metdata failed, errno: %d \n",
+// 					-errno);
+// 		}
+	   
+// 	   //代码调用 ibv_post_send() 函数将发送请求提交到客户端的队列对列（QP）中，并检查是否提交成功。
+
+//        /* We check for completion notification */
+//        ret = process_work_completion_events(io_completion_channels[qp_index], &wc, 1);
+// 		debug("Local buffer metadata has been sent to the client \n");
+		
+
+// 		printf("wait writer \n");
+// 		// ret = process_work_completion_events(io_completion_channels[0], &wc, 1);
+// 		// sleep(5);
+// 		debug("Local buffer metadata has been sent to the client \n");
+// 		return  client_metadata_mr;
+
+// }
+
+ibv_mr *  register_mrs_and_send(ggml_tensor* tensor_dsts[],int qp_index=0,int size =0)  //该函数用于向连接的客户端发送服务器端缓冲区的元数据。
+{
+    printf("register_mrs_and_send\n");
+	struct ibv_wc wc; //工作完成（work completion）结构体
+	    int ret = -1;
+		std::vector<ibv_mr *>  buffer_mrs;
+        buffer_mrs.resize(size);
+		for(int i=0;i<size;++i)
+		{    if(tensor_dsts[i]==NULL||tensor_dsts[i]->data==NULL)
+                {
+                    printf("tensor_dsts[%d]->data==NULL\n",i);
+                }
+			   buffer_mrs[i] = rdma_buffer_register(pd /* which protection domain */, 
+		       tensor_dsts[i]->data,
+			   ggml_nbytes(tensor_dsts[i]) /* what size to allocate */, 
+		       (ibv_access_flags)(IBV_ACCESS_LOCAL_WRITE|
+		       IBV_ACCESS_REMOTE_READ|
+		       IBV_ACCESS_REMOTE_WRITE) /* access permissions */);
+			if(!buffer_mrs[i]){
+				rdma_error("Server failed to create a buffer \n");
+				/* we assume that it is due to out of memory error */
+			}
+			client_metadata_attrs.address[i] = (uint64_t) buffer_mrs[i]->addr;
+			client_metadata_attrs.length[i] = (uint32_t) buffer_mrs[i]->length;
+			client_metadata_attrs.stags[i].local_stag = (uint32_t) buffer_mrs[i]->lkey;
+			
+		}
+			client_metadata_attrs.size = size;
+       /* This buffer is used to transmit information about the above 
+	* buffer to the client. So this contains the metadata about the client 
+	* buffer. Hence this is called metadata buffer. Since this is already 
+	* on allocated, we just register it. 
+        * We need to prepare a send I/O operation that will tell the 
+	* client the address of the client buffer. 
+	*/
+	//代码准备一个发送操作，用于告知客户端服务器端缓冲区的地址。代码将服务器端缓冲区的地址、长度和本地标签信息填充到client_metadata_attr 结构体中
+       ibv_mr * client_metadata_mr = rdma_buffer_register(pd /* which protection domain*/,  //调用 rdma_buffer_register() 函数将其注册到保护域中
+		       &client_metadata_attrs /* which memory to register */, 
+		       sizeof(client_metadata_attrs) /* what is the size of memory */,
+		       IBV_ACCESS_LOCAL_WRITE /* what access permission */);
+       if(!client_metadata_mr){
+	       rdma_error("Server failed to create to hold client metadata \n");
+	       /* we assume that this is due to out of memory error */
+       }
+       /* We need to transmit this buffer. So we create a send request. 
+	* A send request consists of multiple SGE elements. In our case, we only
+	* have one 
+	*/
+		//代码创建一个发送请求，并将 client_metadata_attr 结构体的信息填充到 client_send_sge 结构体中。接着，代码将 client_send_sge 结构体与发送请求关联，并设置发送请求的操作码为 IBV_WR_SEND，表示这是一个发送请求。代码还设置发送请求的标志为 IBV_SEND_SIGNALED，表示希望接收到发送完成的通知。
+	//    client_recv_buffer(client_metadata_mr);
+	   client_send_sge.addr = (uint64_t) &client_metadata_attrs;
+       client_send_sge.length = sizeof(client_metadata_attrs);
+       client_send_sge.lkey = client_metadata_mr->lkey;
+       /* now we link this sge to the send request */
+       bzero(&client_send_wr, sizeof(client_send_wr));
+       client_send_wr.sg_list = &client_send_sge;
+       client_send_wr.num_sge = 1; // only 1 SGE element in the array 
+       client_send_wr.opcode = IBV_WR_SEND; // This is a send request 
+       client_send_wr.send_flags = IBV_SEND_SIGNALED; // We want to get notification 
+       /* This is a fast data path operation. Posting an I/O request */
+	   	// sleep(50);
+		ret = ibv_post_send(client_qps[qp_index] /* which QP */,   
+		&client_send_wr /* Send request that we prepared before */, 
+		&bad_client_send_wr /* In case of error, this will contain failed requests */);
+		if (ret) {
+			rdma_error("Posting of client metdata failed, errno: %d \n",
+					-errno);
+		}
+	   
+	   //代码调用 ibv_post_send() 函数将发送请求提交到客户端的队列对列（QP）中，并检查是否提交成功。
+
+       /* We check for completion notification */
+       ret = process_work_completion_events(io_completion_channels[qp_index], &wc, 1);
+		debug("Local buffer metadata has been sent to the client \n");
+		
+
+		printf("wait writer \n");
+		// ret = process_work_completion_events(io_completion_channels[0], &wc, 1);
+		// sleep(5);
+		debug("Local buffer metadata has been sent to the client \n");
+		return  client_metadata_mr;
+
+}
+
+static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client_dst_mrs,std::vector<ibv_mr *> &client_src_mrs) 
+{	
+	size_t size =client_dst_mrs.size();
+	struct rdma_cm_event *cm_event = NULL;
+	int ret = -1;
+	/* active disconnect from the client side
+{
+	struct rdma_cm_event *cm_event = NULL;
+	int ret = -1;
+	/* active disconnect from the client side */
+	ret = rdma_disconnect(cm_client_id);
 	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
+		rdma_error("Failed to disconnect, errno: %d \n", -errno);
+		//continuing anyways
 	}
-	debug("Receive buffer pre-posting is successful \n");
+	ret = process_rdma_cm_event(cm_event_channel, 
+			RDMA_CM_EVENT_DISCONNECTED,
+			&cm_event);
+	if (ret) {
+		rdma_error("Failed to get RDMA_CM_EVENT_DISCONNECTED event, ret = %d\n",
+				ret);
+		//continuing anyways 
+	}
+	ret = rdma_ack_cm_event(cm_event);
+	if (ret) {
+		rdma_error("Failed to acknowledge cm event, errno: %d\n", 
+			       -errno);
+		//continuing anyways
+	}
+	/* Destroy QP */
+	rdma_destroy_qp(cm_client_id);
+	/* Destroy client cm id */
+	ret = rdma_destroy_id(cm_client_id);
+	if (ret) {
+		rdma_error("Failed to destroy client id cleanly, %d \n", -errno);
+		// we continue anyways;
+	}
+	/* Destroy CQ */
+	ret = ibv_destroy_cq(client_cq);
+	if (ret) {
+		rdma_error("Failed to destroy completion queue cleanly, %d \n", -errno);
+		// we continue anyways;
+	}
+	/* Destroy completion channel */
+	ret = ibv_destroy_comp_channel(io_completion_channel);
+	if (ret) {
+		rdma_error("Failed to destroy completion channel cleanly, %d \n", -errno);
+		// we continue anyways;
+	}
+	/* Destroy memory buffers */
+	for(int i=0;i<size;++i)
+	{
+		rdma_buffer_deregister(client_src_mrs[i]);
+		rdma_buffer_deregister(client_dst_mrs[i]);
+		
+	}
+	rdma_buffer_deregister(server_metadata_mr);
+	rdma_buffer_deregister(client_metadata_mr);	
+
+	/* We free the buffers */
+	// free(tensor_src->data);
+	// free(tensor_dst->data);
+	/* Destroy protection domain */
+	ret = ibv_dealloc_pd(pd);
+	if (ret) {
+		rdma_error("Failed to destroy client protection domain cleanly, %d \n", -errno);
+		// we continue anyways;
+	}
+	rdma_destroy_event_channel(cm_event_channel);
+	printf("Client resource clean up is complete \n");
 	return 0;
 }
+
+
+
 //=============rdma=====================
 static size_t utf8_len(char src) {
     const size_t lookup[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
@@ -2482,7 +2726,7 @@ struct llama_model_loader {
                 lmlock->init(mapping->addr);
             }
         }
-
+        
         size_t done_size = 0;
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
@@ -2546,7 +2790,7 @@ struct llama_model_loader {
             done_size += ggml_nbytes(cur);
         }
     }
-    void load_all_data_rdma(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock) {
+    void load_all_data_rdma(struct ggml_context * ctx, llama_progress_callback progress_callback, void * progress_callback_user_data, llama_mlock * lmlock,int n_layer) {
         size_t size_data = 0;
         size_t size_lock = 0;
         size_t size_pref = 0; // prefetch
@@ -2557,7 +2801,7 @@ struct llama_model_loader {
         std::vector<struct ggml_tensor *> tensor_srcs;
         std::vector<struct ggml_tensor *> tensor_dsts;
         std::vector<struct ggml_tensor *> tensor_result;
-        static struct rdma_buffer_attr_vec server_metadata_attrs;
+
         static struct rdma_buffer_attr_vec client_metadata_attrs;
         size_t size =gguf_get_n_tensors(ctx_gguf);
         tensor_dsts.resize(size);	
@@ -2569,8 +2813,10 @@ struct llama_model_loader {
         struct sockaddr_in server_sockaddr = get_server_sockaddr(ip, port);
         //==========rdma==========
 	    client_prepare_connection_api(&server_sockaddr);
-        client_recv_buffer(server_metadata_attrs);
-        client_connect_to_server();
+	    client_recv_buffer(server_metadata_attrs,0); 
+	    client_recv_buffer(server_metadata_attrs_sparse_tensor,2); 
+	    client_connect_to_server();
+	    wait_for_server_ready(server_metadata_attrs,0);
 
         for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
@@ -2608,11 +2854,17 @@ struct llama_model_loader {
                 #endif
             
         }
-            client_src_mrs= client_register_mrs(tensor_dsts);
+            client_src_mrs= register_mrs(tensor_dsts);
             //计时
             clock_t start = clock();
-            client_operation(client_src_mrs,server_metadata_attrs,IBV_WR_RDMA_READ);
+            // client_operation(client_src_mrs,server_metadata_attrs,IBV_WR_RDMA_READ);
+            client_operation(client_src_mrs,server_metadata_attrs,IBV_WR_RDMA_READ,0,2,1);
+
             std::cout << "花费了" << (double)(clock() - start) / CLOCKS_PER_SEC << "秒" << std::endl;
+            register_mrs_and_send(sparse_tensor,1,n_layer);
+
+            wait_for_server_ready(server_metadata_attrs_sparse_tensor,2);
+
             // exit(1);
             for (int i = 0; i < gguf_get_n_tensors(ctx_gguf); i++) {
             struct ggml_tensor * cur = ggml_get_tensor(ctx, gguf_get_tensor_name(ctx_gguf, i));
@@ -3712,6 +3964,10 @@ static void llm_load_sparse_model_tensors(
                         layer.mlp_pre_w2 = create_tensor(tn(LLM_TENSOR_MLP_PRED_FC2, "weight", i), {GGML_NE_WILDCARD, n_ff});
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
                                             // ggml_set_f32(layer.ffn_up,100.f);
+                        sparse_tensor[i*3] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, 1);
+                        sparse_tensor[i*3+1] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+                        sparse_tensor[i*3+2] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, 1);
+
                         if(layer.ffn_gate->data!=NULL && layer.mlp_pre_w1->data==NULL)
                         {
                             printf("layer.ffn_gate.data!=NULL && layer.mlp_pre_w1==NULL\n");
@@ -3779,7 +4035,7 @@ static void llm_load_sparse_model_tensors(
         model.tensors_by_name.emplace_back(ggml_get_name(cur), cur);
     }
 
-    ml.load_all_data_rdma(ctx, progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL);
+    ml.load_all_data_rdma(ctx, progress_callback, progress_callback_user_data, use_mlock ? &model.mlock_mmap : NULL,hparams.n_layer);
 
     if (progress_callback) {
         progress_callback(1.0f, progress_callback_user_data);
@@ -4473,9 +4729,15 @@ static void llm_load_tensors(
                         layer.ffn_norm_b = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_NORM, "bias", i), {n_embd}, backend);
 
                         layer.ffn_gate = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, backend_split);
+                        // sparse_tensor[i*3+2] = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_ff ,1);
+                        // prompt_sparse_tensor[i*3+2] = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_ff ,num_promt);
                         layer.ffn_down = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, backend_split);
+                        // sparse_tensor[i*3+1] = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_embd ,1);
+                        // prompt_sparse_tensor[i*3+1] = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_embd ,num_promt);
                         layer.ffn_up = ml.create_tensor(ctx, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, backend_split);
-
+                        // sparse_tensor[i*3] =ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_ff ,1);
+                        // prompt_sparse_tensor[i*3] =ggml_new_tensor_2d(ctx,GGML_TYPE_F32,  n_ff ,num_promt);
+                        
                         if (backend == GGML_BACKEND_GPU) {
                             vram_weights +=
                                 ggml_nbytes(layer.attn_norm) + ggml_nbytes(layer.wq)       + ggml_nbytes(layer.wk)       +

@@ -644,7 +644,18 @@ if (GGML_USE_CPU_HBM)
     add_definitions(-DGGML_USE_CPU_HBM)
     find_library(memkind memkind REQUIRED)
 endif()
+# 查找libibverbs库
+find_library(IBVERBS_LIBRARY NAMES ibverbs PATHS /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu)
 
+# 确保找到了库
+if(NOT IBVERBS_LIBRARY)
+    message(FATAL_ERROR "libibverbs not found")
+endif()
+
+# 在需要链接libibverbs的目标上使用找到的库路径
+find_library(RDMACM_LIBRARY rdmacm HINTS /home/atr/local/lib)
+
+link_libraries(pthread ${IBVERBS_LIBRARY} ${RDMACM_LIBRARY})
 add_library(ggml OBJECT
             ggml.c
             ggml.h
@@ -664,6 +675,8 @@ add_library(ggml OBJECT
 target_include_directories(ggml PUBLIC . ${LLAMA_EXTRA_INCLUDES})
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+target_link_libraries(ggml PUBLIC ${IBVERBS_LIBRARY})
+
 if (GGML_USE_CPU_HBM)
     target_link_libraries(ggml PUBLIC memkind)
 endif()
@@ -697,7 +710,7 @@ target_include_directories(llama PUBLIC .)
 target_compile_features(llama PUBLIC cxx_std_11) # don't bump
 target_link_libraries(llama PRIVATE
     ggml
-    rdma_common # for rdma_example 将rdma_example的头文件加入到llama中
+    # rdma_common # for rdma_example 将rdma_example的头文件加入到llama中
     ${LLAMA_EXTRA_LIBS}
     )
 
@@ -708,6 +721,10 @@ if (BUILD_SHARED_LIBS)
         set_target_properties(llama PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ggml-metal.metal")
     endif()
 endif()
+
+
+
+
 
 
 #
@@ -802,10 +819,10 @@ endif ()
 if (LLAMA_BUILD_EXAMPLES)
     add_subdirectory(examples)
     add_subdirectory(pocs)
-    add_subdirectory(rdma-example)
+    # add_subdirectory(rdma-example)
 endif()
 
 
 
-target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/rdma-example/src/)#将rdma_example的头文件加入到llama中
+# target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/rdma-example/src/)#将rdma_example的头文件加入到llama中
 

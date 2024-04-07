@@ -30,6 +30,9 @@ make
 ###### server
 ```text
 ./bin/rdma_server
+./build/bin/rdma_server_graph 
+./build/bin/rdma_server_LLM_API
+./build/bin/rdma_server_LLM_API_mqp
 ```
 ###### client
 ```text
@@ -48,6 +51,9 @@ atr@atr:~/rdma-example$
 ```
 ```
 ./bin/rdma_client -a 10.119.46.61 -s textstring
+./build/bin/rdma_client_graph
+./build/bin/rdma_client_LLM_API -s asdas -a 10.119.46.62
+./build/bin/rdma_client_LLM_API_mqp 
 ```
 ## Does not have an RDMA device?
 In case you do not have an RDMA device to test the code, you can setup SofitWARP software RDMA device on your Linux machine. Follow instructions here: [https://github.com/animeshtrivedi/blog/blob/master/post/2019-06-26-siw.md](https://github.com/animeshtrivedi/blog/blob/master/post/2019-06-26-siw.md).

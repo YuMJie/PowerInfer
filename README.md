@@ -184,12 +184,16 @@ For the same reason, we suggest keeping the same directory structure as PowerInf
 
 ### server
 ```
-./build/bin/main_server -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time" 
+./build/bin/main_server -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time" --no-mmap --seed 0 --temp 0 
+./build/bin/main_server -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --no-mmap
+
 ```
 
 ### client
 ```
-./build/bin/main_client -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time"  --seed 0 --temp 0 
+./build/bin/main_client -m ./Falcon-40B/falcon-40b-relu.q4.powerinfer.gguf  -n 128 -t 8 -p "Once upon a time"  --seed 0 --temp 0 --no-mmap
+./build/bin/main_client -m ./ReluLLaMA-7B/llama-7b-relu.powerinfer.gguf -n 128 -t 8 -p "Once upon a time" --no-mmap --seed 0 --temp 0 
+
 ```
 
 For CPU-only and CPU-GPU hybrid inference with all available VRAM, you can use the following instructions to run PowerInfer:

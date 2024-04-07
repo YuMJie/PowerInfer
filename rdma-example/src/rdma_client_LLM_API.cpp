@@ -265,6 +265,38 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	debug("QP created at %p \n", client_qp);
 	return 0;
 }
+
+static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs)
+{
+	int ret = -1;
+
+	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
+			&server_metadata_attrs,
+			sizeof(server_metadata_attrs),
+			(IBV_ACCESS_LOCAL_WRITE));
+	if(!server_metadata_mr){
+		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
+		return -ENOMEM;
+	}
+	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
+	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
+	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
+	/* now we link it to the request */
+	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
+	server_recv_wr.sg_list = &server_recv_sge;
+	server_recv_wr.num_sge = 1;
+	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
+		      &server_recv_wr /* receive work request*/,
+		      &bad_server_recv_wr /* error WRs */);
+	if (ret) {
+		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
+		return ret;
+	}
+	debug("Receive buffer pre-posting is successful \n");
+	return 0;
+}
+
+
 static int client_connect_to_server() 
 {
 	struct rdma_conn_param conn_param;
@@ -375,11 +407,11 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 					-errno);
 			return -errno;
 		}
-		if((i+1)%5==0)
+		if((i+1)%MAX_WR==0)
 		{
 			ret = process_work_completion_events(io_completion_channel, 
-			wc, 5);
-			if(ret != 5) {
+			wc, MAX_WR);
+			if(ret != MAX_WR) {
 				rdma_error("We failed to get 2 work completions , ret = %d \n",
 						ret);
 				return ret;
@@ -388,8 +420,8 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 	/* Now we prepare a READ using same variables but for destination */ //将目标缓冲区的地址、长度和本地键赋值给client_send_sge结构体，表示接收的数据
 	}
 	ret = process_work_completion_events(io_completion_channel, 
-	wc, size%5);
-	if(ret != size%5) {
+	wc, size%MAX_WR);
+	if(ret != size%MAX_WR) {
 		rdma_error("We failed to get 2 work completions , ret = %d \n",
 				ret);
 		return ret;
@@ -397,36 +429,6 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 	debug("Client side READ is complete \n");
 	return 0;
 }
-static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs)
-{
-	int ret = -1;
-
-	server_metadata_mr = rdma_buffer_register(pd, //rdma_buffer_register函数来注册一个内存区域，该区域用于存储服务器的元数据。rdma_buffer_register函数接受一些参数，包括一个指向内存区域的指针、内存区域的大小以及访问权限。
-			&server_metadata_attrs,
-			sizeof(server_metadata_attrs),
-			(IBV_ACCESS_LOCAL_WRITE));
-	if(!server_metadata_mr){
-		rdma_error("Failed to setup the server metadata mr , -ENOMEM\n");
-		return -ENOMEM;
-	}
-	server_recv_sge.addr = (uint64_t) server_metadata_mr->addr;
-	server_recv_sge.length = (uint32_t) server_metadata_mr->length;
-	server_recv_sge.lkey = (uint32_t) server_metadata_mr->lkey;
-	/* now we link it to the request */
-	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	server_recv_wr.sg_list = &server_recv_sge;
-	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qp /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr /* receive work request*/,
-		      &bad_server_recv_wr /* error WRs */);
-	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
-	}
-	debug("Receive buffer pre-posting is successful \n");
-	return 0;
-}
-
 
 static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client_dst_mrs,std::vector<ibv_mr *> &client_src_mrs) 
 {	

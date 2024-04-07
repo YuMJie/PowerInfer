@@ -33,10 +33,10 @@ static struct ibv_mr *client_metadata_mr = NULL,
 		     *client_src_mr = NULL, 
 		     *client_dst_mr = NULL, 
 		     *server_metadata_mr = NULL;
+std::vector<struct ibv_mr *> client_buffer_mrs;
 static struct rdma_buffer_attr client_metadata_attr, server_metadata_attr;
 static struct ibv_send_wr client_send_wr, *bad_client_send_wr = NULL;
 static struct ibv_recv_wr server_recv_wr, *bad_server_recv_wr = NULL;
-static struct ibv_recv_wr server_recv_wr_1, *bad_server_recv_wr_1 = NULL;
 static struct ibv_sge client_send_sge, server_recv_sge;
 /* Source and Destination buffers, where RDMA operations source and sink */
 // static struct rdma_buffer_attr_vec server_metadata_attrs;
@@ -44,35 +44,11 @@ static struct rdma_buffer_attr_vec client_metadata_attrs;
 
 static struct ibv_qp_init_attr qp_init_attr;
 static struct ibv_qp_init_attr qp_init_attrs[NUM_QPS];
-std::vector<struct ibv_mr *> client_buffer_mrs;
 
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
-
-static int recv(int qp_index=0)
-{
-	int ret = -1;
-
-	// client_recv_sge.addr = (uint64_t) server_mr->addr;
-	// client_recv_sge.length = (uint32_t) server_mr->length;
-	// client_recv_sge.lkey = (uint32_t) server_mr->lkey;
-	// /* now we link it to the request */
-	// bzero(&client_recv_sge, sizeof(client_recv_sge)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
-	// client_recv_wr.sg_list = &client_recv_sge;
-	// client_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qps[qp_index] /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
-		      &server_recv_wr_1 /* receive work request*/,
-		      &bad_server_recv_wr_1 /* error WRs */);
-	if (ret) {
-		rdma_error("Failed to pre-post the receive buffer, errno: %d \n", ret);
-		return ret;
-	}
-	debug("Receive buffer pre-posting is successful \n");
-	return 0;
-}
-
 
 static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * graph, int n_threads) {
     struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
@@ -365,7 +341,7 @@ static int client_prepare_connection_api(struct sockaddr_in *s_addr)
 	return 0;
 }
 
-static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs ,int qp_index=0 )
+static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs,int client_qps_index=0)
 {
 	int ret = -1;
 
@@ -384,7 +360,7 @@ static int client_recv_buffer(rdma_buffer_attr_vec & server_metadata_attrs ,int 
 	bzero(&server_recv_wr, sizeof(server_recv_wr)); //bzero函数将server_recv_wr结构体清零，并将server_recv_sge结构体的地址赋值给server_recv_wr的sg_list成员，将1赋值给server_recv_wr的num_sge成员。这些操作将接收缓冲区的属性与请求相关联。
 	server_recv_wr.sg_list = &server_recv_sge;
 	server_recv_wr.num_sge = 1;
-	ret = ibv_post_recv(client_qps[qp_index] /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
+	ret = ibv_post_recv(client_qps[client_qps_index] /* which QP */, //代码调用ibv_post_recv函数来提交接收工作请求。该函数接受一些参数，包括一个指向客户端QP（Queue Pair）的指针、一个指向接收工作请求的指针以及一个指向错误工作请求的指针。如果提交成功，函数将返回0，否则返回一个非零值
 		      &server_recv_wr /* receive work request*/,
 		      &bad_server_recv_wr /* error WRs */);
 	if (ret) {
@@ -430,7 +406,8 @@ static int client_connect_to_server()
 	}
 	return 0;
 }
-std::vector<ibv_mr *> register_mrs(std::vector<ggml_tensor *> &tensor_src)
+
+std::vector<ibv_mr *>  client_register_mrs(std::vector<ggml_tensor *> &tensor_src)
 {	
 	std::vector<ibv_mr *> client_src_mrs(tensor_src.size());
 	struct ibv_wc wc[2];
@@ -462,12 +439,13 @@ std::vector<ibv_mr *> register_mrs(std::vector<ggml_tensor *> &tensor_src)
 
 	return client_src_mrs;
 }
-void wait_for_server_ready(rdma_buffer_attr_vec & server_metadata_attrs ,int qp_index=0)
+
+void wait_for_server_ready(rdma_buffer_attr_vec & server_metadata_attrs,int client_qps_index=0)
 {
 	printf("Waiting for server to be ready \n");
 	struct ibv_wc wc;
 	int ret = -1;
-    ret = process_work_completion_events(io_completion_channels[qp_index], //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
+    ret = process_work_completion_events(io_completion_channels[client_qps_index], //process_work_completion_events函数来等待并处理两个工作完成事件。一个是发送工作请求的完成事件，另一个是接收服务器发送的缓冲区信息的完成事件。如果成功接收到两个工作完成事件，代码会打印服务器发送的缓冲区位置和凭证信息。
 			&wc, 1);
 
 	if(ret != 1) {
@@ -480,7 +458,7 @@ void wait_for_server_ready(rdma_buffer_attr_vec & server_metadata_attrs ,int qp_
 }
 
 //通过存储tensor_dst的信息的client_dst_mrs和服务端server_metadata_attrs的信息，从服务器读取数据
-static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs,ibv_wr_opcode opcode,int start,int end,int qp_index=0) 
+static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_attr_vec & server_metadata_attrs,ibv_wr_opcode opcode,int start,int end,int client_qps_index =0) 
 {	
 
 	int size =client_dst_mrs.size();
@@ -493,7 +471,7 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 	//将本地缓冲区的地址、长度和本地键（lkey）赋值给client_send_sge结构体，表示发送的数据。
 	printf("size=%d\n",size);
 
-	for(int i=0;i<size;++i)
+	for(int i=0;i<std::min(end,size);++i)
 	{	printf("i=%d\n",i);
 		client_send_sge.addr = (uint64_t) client_dst_mrs[i]->addr;
 		client_send_sge.length = (uint32_t) client_dst_mrs[i]->length;
@@ -503,12 +481,12 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 		client_send_wr.sg_list = &client_send_sge;
 		client_send_wr.num_sge = 1;
 		client_send_wr.opcode = opcode;
-		client_send_wr.send_flags = 0;
+		client_send_wr.send_flags = IBV_SEND_SIGNALED;
 		/* we have to tell server side info for RDMA */ // 设置远程RDMA操作的相关信息，包括远程键和远程地址。
 		client_send_wr.wr.rdma.rkey = server_metadata_attrs.stags[i].remote_stag;
 		client_send_wr.wr.rdma.remote_addr = server_metadata_attrs.address[i];
 		/* Now we post it */
-		int ret = ibv_post_send(client_qps[qp_index],  //函数将发送请求发送到RDMA队列中。
+		int ret = ibv_post_send(client_qps[client_qps_index],  //函数将发送请求发送到RDMA队列中。
 				&client_send_wr,
 			&bad_client_send_wr);
 		if (ret) {
@@ -516,9 +494,9 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 					-errno);
 			return -errno;
 		}
-		if(client_send_wr.send_flags&&(i+1)%5==0)
+		if((i+1)%5==0)
 		{
-			ret = process_work_completion_events(io_completion_channels[qp_index], 
+			ret = process_work_completion_events(io_completion_channels[client_qps_index], 
 			wc, 5);
 			if(ret != 5) {
 				rdma_error("We failed to get 2 work completions , ret = %d \n",
@@ -529,20 +507,18 @@ static int client_operation(std::vector<ibv_mr *> client_dst_mrs,rdma_buffer_att
 	/* Now we prepare a READ using same variables but for destination */ //将目标缓冲区的地址、长度和本地键赋值给client_send_sge结构体，表示接收的数据
 	}
 	printf("waiting for work completions \n");
-	if(client_send_wr.send_flags){
-			ret = process_work_completion_events(io_completion_channels[qp_index], 
-		wc, size%5);
-		if(ret != size%5) {
-			rdma_error("We failed to get %d work completions , ret = %d  %s\n",
-					size%5,ret, strerror(errno));
-			return ret;
-		}
+	ret = process_work_completion_events(io_completion_channels[client_qps_index], 
+	wc, size%5);
+	if(ret != size%5) {
+		rdma_error("We failed to get 2 work completions , ret = %d  %s\n",
+				ret, strerror(errno));
+		return ret;
 	}
 	debug("Client side %d is complete \n",opcode);
 	return 0;
 }
 
-ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_index=0 )  //该函数用于向连接的客户端发送服务器端缓冲区的元数据。
+ibv_mr *  register_mrs_to_server(std::vector<ggml_tensor*> tensor_dsts,int client_qps_index =0)  //该函数用于向连接的客户端发送服务器端缓冲区的元数据。
 {
 	struct ibv_wc wc; //工作完成（work completion）结构体
 	int ret = -1;
@@ -558,7 +534,7 @@ ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_ind
 		       IBV_ACCESS_REMOTE_READ|
 		       IBV_ACCESS_REMOTE_WRITE) /* access permissions */);
 			if(!client_buffer_mrs[i]){
-				rdma_error("Server failed to create a buffer \n");
+				rdma_error("client failed to create a buffer \n");
 				/* we assume that it is due to out of memory error */
 			}
 			client_metadata_attrs.address[i] = (uint64_t) client_buffer_mrs[i]->addr;
@@ -580,7 +556,7 @@ ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_ind
 		       sizeof(client_metadata_attrs) /* what is the size of memory */,
 		       IBV_ACCESS_LOCAL_WRITE /* what access permission */);
        if(!client_metadata_mr){
-	       rdma_error("Server failed to create to hold client metadata \n");
+	       rdma_error("client failed to create to hold client metadata \n");
 	       /* we assume that this is due to out of memory error */
        }
        /* We need to transmit this buffer. So we create a send request. 
@@ -588,8 +564,7 @@ ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_ind
 	* have one 
 	*/
 		//代码创建一个发送请求，并将 client_metadata_attr 结构体的信息填充到 client_send_sge 结构体中。接着，代码将 client_send_sge 结构体与发送请求关联，并设置发送请求的操作码为 IBV_WR_SEND，表示这是一个发送请求。代码还设置发送请求的标志为 IBV_SEND_SIGNALED，表示希望接收到发送完成的通知。
-	//    client_recv_buffer(client_metadata_mr);
-	   client_send_sge.addr = (uint64_t) &client_metadata_attrs;
+ 	   client_send_sge.addr = (uint64_t) &client_metadata_attrs;
        client_send_sge.length = sizeof(client_metadata_attrs);
        client_send_sge.lkey = client_metadata_mr->lkey;
        /* now we link this sge to the send request */
@@ -600,7 +575,7 @@ ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_ind
        client_send_wr.send_flags = IBV_SEND_SIGNALED; // We want to get notification 
        /* This is a fast data path operation. Posting an I/O request */
 	   	// sleep(50);
-		ret = ibv_post_send(client_qps[qp_index] /* which QP */,   
+		ret = ibv_post_send(client_qps[client_qps_index] /* which QP */,   
 		&client_send_wr /* Send request that we prepared before */, 
 		&bad_client_send_wr /* In case of error, this will contain failed requests */);
 		if (ret) {
@@ -611,17 +586,13 @@ ibv_mr *  register_mrs_and_send(std::vector<ggml_tensor*> tensor_dsts,int qp_ind
 	   //代码调用 ibv_post_send() 函数将发送请求提交到客户端的队列对列（QP）中，并检查是否提交成功。
 
        /* We check for completion notification */
-       ret = process_work_completion_events(io_completion_channels[qp_index], &wc, 1);
+        ret = process_work_completion_events(io_completion_channels[client_qps_index], &wc, 1);
 		debug("Local buffer metadata has been sent to the client \n");
-		
 
-		printf("wait writer \n");
-		// ret = process_work_completion_events(io_completion_channels[0], &wc, 1);
-		// sleep(5);
-		debug("Local buffer metadata has been sent to the client \n");
 		return  client_metadata_mr;
 
 }
+
 
 static int client_disconnect_and_clean_LLM_vec_api(std::vector<ibv_mr *> &client_dst_mrs,std::vector<ibv_mr *> &client_src_mrs) 
 {	
@@ -797,87 +768,79 @@ int main(int argc, char ** argv)  {
 
     printf("Creating new tensors\n");
     // printf("Creating new tensor m1\n");
-    struct ggml_tensor * m11 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizey);
+    struct ggml_tensor * m11 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     // ggml_set_backend(m11, GGML_BACKEND_GPU);
     // ggml_cuda_transform_tensor(m11->data, m11);
 
-    ggml_set_f32(m11, 1.0f);
+    ggml_set_f32(m11, 4.0f);
     printf_nb(m11);
-    printf_set(m11);
+    // printf_set(m11);
     printf_value(m11);
     // printf("Creating new tensor m1\n");
-    struct ggml_tensor * m12 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizey, sizez);
+    struct ggml_tensor * m12 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     // ggml_set_backend(m12, GGML_BACKEND_GPU);
     // ggml_cuda_transform_tensor(m12->data, m12);
     ggml_set_f32(m12, 1.5f);
     printf_nb(m12);
-    printf_set(m12);
+    // printf_set(m12);
     printf_value(m12);
 
-    struct ggml_tensor * m13 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizez, sizez);
-    // ggml_set_backend(m13, GGML_BACKEND_GPU);
-    // ggml_cuda_transform_tensor(m13->data, m13);
-    ggml_set_f32(m13, 1.5f);
-    printf_nb(m13);
-    printf_set(m13);
-    printf_value(m13);
+    struct ggml_tensor * m21 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+    // ggml_set_backend(m21, GGML_BACKEND_GPU);
+    // ggml_cuda_transform_tensor(m21->data, m21);
+    ggml_set_f32(m21, 1.5f);
+    printf_nb(m21);
+    // printf_set(m21);
+    printf_value(m21);
 
 
-    // printf("Creating new tensor m2\n");
-    struct ggml_tensor * m2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sizex, sizez);
+    // printf("Creating new tensor m22\n");
+    struct ggml_tensor * m22 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
 
-    ggml_set_f32(m2, 2.0f);
-    printf_nb(m2);
-    printf_set(m2);
-    printf_value(m2);
+    ggml_set_f32(m22, 2.0f);
+    printf_nb(m22);
+    // printf_set(m22);
+    printf_value(m22);
 
     printf("\n------ Test 1 - Matrix Mult via F32 code\n");
     // printf("Creating new tensor m11xm2\n");
-    struct ggml_tensor * m11xm2 = ggml_mul_mat(ctx, m11, m2);
+    struct ggml_tensor * m11xm12 = ggml_mul_mat(ctx, m11, m12);
     printf("m11xm2_1\n");
-    tensor_srcs.push_back(m11xm2);
+    tensor_srcs.push_back(m11xm12);
     //将m11xm2发送给server write
-    struct ggml_tensor * m11xm2_1 = ggml_mul_mat(ctx, m11xm2, m12);
-    tensor_dsts.push_back(m11xm2_1);
+    struct ggml_tensor * m21xm22 = ggml_mul_mat_client(ctx, m11xm12, m22);
+	
+	ggml_set_f32(m21xm22, 12.0f);
+    tensor_dsts.push_back(m21xm22);
     //得到server的输出后继续计算 read
     printf("m11xm2_2\n");
 
-    struct ggml_tensor * m11xm2_2 = ggml_mul_mat(ctx, m11xm2_1, m13);
+    struct ggml_tensor * m11xm22 = ggml_mul_mat(ctx, m21xm22, m11xm12);
     
-    printf_value(m11xm2_2);
+    printf_value(m11xm22);
     // ggml_set_backend(m11xm2, GGML_BACKEND_GPU);
 
     // printf("Creating compute graph\n");
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, m11xm2_2);
+    ggml_build_forward_expand(gf, m11xm22);
 
     printf("n_threads=%i\n", benchmark_params.n_threads);
 
     TENSOR_DUMP(m11);
-    TENSOR_DUMP(m2);
+    TENSOR_DUMP(m22);
 
     //RDMA
-
-
-
 	struct sockaddr_in server_sockaddr = get_server_sockaddr(ip, port);
 	client_prepare_connection_api(&server_sockaddr);
-	client_recv_buffer(server_metadata_attrs,0); 
-	client_connect_to_server();
-    register_mrs_and_send(tensor_dsts,1);
-    client_src_mrs= register_mrs(tensor_srcs);
-	wait_for_server_ready(server_metadata_attrs,0);
+	client_recv_buffer(server_metadata_attrs); 
+    client_connect_to_server();
 
-	recv(0);
+    client_dst_mrs= client_register_mrs(tensor_dsts);
+    ibv_mr *  client_metadata_mr = register_mrs_to_server(tensor_srcs);
+	wait_for_server_ready(server_metadata_attrs);
 	// client_operation(client_dst_mrs,server_metadata_attrs,IBV_WR_RDMA_READ,0,2);
-	printf("start write\n");
-	sleep(5);
-	client_operation(client_src_mrs,server_metadata_attrs,IBV_WR_RDMA_WRITE_WITH_IMM,0,2,1);
-	ibv_wc wc;
-	printf_value(m11xm2_1);
-	printf("wait server write\n");
-	process_work_completion_events(io_completion_channels[0], &wc, 1);
-	printf_value(m11xm2_1);
+	client_operation(client_dst_mrs,server_metadata_attrs,IBV_WR_RDMA_WRITE_WITH_IMM,0,2);
+
     std::vector<uint8_t> work_buffer;
 
     ggml_graph_compute_helper(work_buffer, gf, benchmark_params.n_threads);

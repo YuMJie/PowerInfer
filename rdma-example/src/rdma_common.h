@@ -10,7 +10,7 @@
 #ifndef RDMA_COMMON_H
 #define RDMA_COMMON_H
 
-#include <iostream>
+// #include <iostream>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@
 
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
-#include <vector>
+// #include <vector>
 /* Error Macro*/
 #define rdma_error(msg, args...) \
 		do {\
@@ -47,16 +47,16 @@
 
 // #else 
 
-// #define debug(msg, args...) 
+#define debug(msg, args...) 
 
 // #endif /* ACN_RDMA_DEBUG */
 
-template<typename... Args>
-void debug(const char* msg, Args... args) {
-    printf("DEBUG: ");
-    printf(msg, args...);
-    printf("\n");
-}
+// template<typename... Args>
+// void debug(const char* msg, Args... args) {
+//     printf("DEBUG: ");
+//     printf(msg, args...);
+//     printf("\n");
+// }
 /* Capacity of the completion queue (CQ) */
 #define CQ_CAPACITY (16)
 /* MAX SGE capacity */
@@ -72,7 +72,7 @@ void debug(const char* msg, Args... args) {
  *
  * For details see: http://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  */
-enum FFN_TYPE{
+enum FFN_TYPE1{
 	FFN_UP,
 	FFN_DOWN,
 	FFN_GATE
@@ -98,7 +98,7 @@ union stag {
 struct __attribute((packed)) rdma_buffer_attr_vec {
   uint64_t address[1000];
   uint32_t length[1000];
-  enum FFN_TYPE type[400];
+  enum FFN_TYPE1 type[400];
   uint8_t il[400];
   uint64_t size;
   stag stags[1000];
